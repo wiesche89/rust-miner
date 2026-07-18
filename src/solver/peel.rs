@@ -1,0 +1,149 @@
+use std::collections::VecDeque;
+
+use crate::{
+    siphash::endpoint,
+    solver::{GraphParams, SolveError, d2::radix_order},
+};
+
+/// Computes the exact bipartite 2-core of a survivor set. An edge is removed
+/// whenever it has no live mate (`endpoint ^ 1`) on either side. Removing an
+/// edge can make another endpoint empty, so a queue continues to a fixpoint.
+/// Every cycle is preserved.
+pub(crate) fn peel_two_core(
+    request: GraphParams,
+    survivors: &[u64],
+) -> Result<Vec<u64>, SolveError> {
+    if survivors.len() > u32::MAX as usize {
+        return Err(SolveError::Unsupported(
+            "2-core survivor index exceeds u32".into(),
+        ));
+    }
+    if survivors.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut edge_groups = vec![[0_u32; 2]; survivors.len()];
+    let mut group_keys = Vec::<u32>::with_capacity(survivors.len());
+    let mut group_offsets = vec![0_usize];
+    let mut group_edges = Vec::<u32>::with_capacity(survivors.len() * 2);
+    let mut side_group_starts = [0_usize; 3];
+    let endpoint_pairs: Vec<[u32; 2]> = survivors
+        .iter()
+        .map(|&edge| {
+            [
+                endpoint(request.keys, request.edge_bits, edge, 0),
+                endpoint(request.keys, request.edge_bits, edge, 1),
+            ]
+        })
+        .collect();
+
+    // Radix order turns every endpoint group into one contiguous CSR run.
+    // This avoids a HashMap lookup per edge and a heap allocation per group.
+    for side in [0_usize, 1] {
+        let keys: Vec<u32> = endpoint_pairs.iter().map(|pair| pair[side]).collect();
+        let order = radix_order(&keys);
+        let mut begin = 0;
+        while begin < order.len() {
+            let key = keys[order[begin] as usize];
+            let mut end = begin + 1;
+            while end < order.len() && keys[order[end] as usize] == key {
+                end += 1;
+            }
+            let group = group_keys.len() as u32;
+            group_keys.push(key);
+            for &edge in &order[begin..end] {
+                edge_groups[edge as usize][side] = group;
+                group_edges.push(edge);
+            }
+            group_offsets.push(group_edges.len());
+            begin = end;
+        }
+        side_group_starts[side + 1] = group_keys.len();
+    }
+
+    let mut mate_group = vec![None; group_keys.len()];
+    for side in 0..2 {
+        let start = side_group_starts[side];
+        let end = side_group_starts[side + 1];
+        for group in start..end {
+            mate_group[group] = group_keys[start..end]
+                .binary_search(&(group_keys[group] ^ 1))
+                .ok()
+                .map(|index| (start + index) as u32);
+        }
+    }
+
+    let mut live_count: Vec<usize> = group_offsets
+        .windows(2)
+        .map(|range| range[1] - range[0])
+        .collect();
+    let mut alive = vec![true; survivors.len()];
+    let mut queued = vec![false; group_keys.len()];
+    let mut queue = VecDeque::new();
+    for group in 0..group_keys.len() {
+        if mate_group[group].is_none_or(|mate| live_count[mate as usize] == 0) {
+            queued[group] = true;
+            queue.push_back(group as u32);
+        }
+    }
+
+    while let Some(group) = queue.pop_front() {
+        let group = group as usize;
+        for &edge in &group_edges[group_offsets[group]..group_offsets[group + 1]] {
+            let edge = edge as usize;
+            if !alive[edge] {
+                continue;
+            }
+            alive[edge] = false;
+            for &incident in &edge_groups[edge] {
+                let incident = incident as usize;
+                live_count[incident] -= 1;
+                if live_count[incident] == 0
+                    && let Some(mate) = mate_group[incident]
+                {
+                    let mate = mate as usize;
+                    if !queued[mate] {
+                        queued[mate] = true;
+                        queue.push_back(mate as u32);
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(survivors
+        .iter()
+        .zip(alive)
+        .filter_map(|(&edge, alive)| alive.then_some(edge))
+        .collect())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{keys::derive_keys, solver::cpu_lean::trim_survivors};
+
+    #[test]
+    fn peel_is_idempotent_and_only_removes_edges() {
+        let request = GraphParams {
+            keys: derive_keys(&[0], 7),
+            edge_bits: 12,
+            cycle_length: 4,
+            rounds: 4,
+        };
+        let survivors = trim_survivors(request, 12).unwrap();
+        let peeled = peel_two_core(request, &survivors).unwrap();
+        assert!(peeled.len() <= survivors.len());
+        assert_eq!(peel_two_core(request, &peeled).unwrap(), peeled);
+
+        let converged = trim_survivors(
+            GraphParams {
+                rounds: 200,
+                ..request
+            },
+            12,
+        )
+        .unwrap();
+        assert_eq!(peeled, converged);
+    }
+}
