@@ -62,10 +62,14 @@ pub(crate) fn peel_two_core(
         let start = side_group_starts[side];
         let end = side_group_starts[side + 1];
         for group in start..end {
-            mate_group[group] = group_keys[start..end]
-                .binary_search(&(group_keys[group] ^ 1))
-                .ok()
-                .map(|index| (start + index) as u32);
+            let neighbor = if group_keys[group].is_multiple_of(2) {
+                (group + 1 < end).then_some(group + 1)
+            } else {
+                group.checked_sub(1).filter(|&index| index >= start)
+            };
+            mate_group[group] = neighbor
+                .filter(|&index| group_keys[index] == group_keys[group] ^ 1)
+                .map(|index| index as u32);
         }
     }
 

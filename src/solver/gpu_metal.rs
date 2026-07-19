@@ -1694,8 +1694,7 @@ mod native {
                 params,
             };
             let destination = self.empty_part_like(&source, buckets)?;
-            let survivors =
-                self.shared_buffer(word_count * size_of::<u32>(), "hybrid survivors")?;
+            let survivors = edges;
             unsafe {
                 survivors
                     .contents()
