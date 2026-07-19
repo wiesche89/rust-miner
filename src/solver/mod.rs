@@ -17,18 +17,11 @@ pub enum TrimmingMode {
     Slean,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct JobContext {
-    pub height: u64,
-    pub job_id: u64,
-    pub difficulty: u64,
-}
-
 #[derive(Debug, Clone)]
 pub struct SolveRequest {
     pub pre_pow: Vec<u8>,
     pub nonce: u64,
-    pub job: Option<JobContext>,
+    pub live_work: bool,
     pub edge_bits: u8,
     pub cycle_length: usize,
     pub rounds: u32,
@@ -105,7 +98,7 @@ pub fn validate_request(
             "cycle_length must be even and in 2..=64".into(),
         ));
     }
-    if request.job.is_some() && request.cycle_length != capabilities.cycle_length {
+    if request.live_work && request.cycle_length != capabilities.cycle_length {
         return Err(SolveError::Unsupported(format!(
             "live backend requires cycle_length {}",
             capabilities.cycle_length
@@ -134,6 +127,9 @@ pub enum SolveError {
 pub trait Solver: Send {
     fn name(&self) -> &'static str;
     fn capabilities(&self) -> BackendCapabilities;
+    fn recover(&mut self) -> Result<(), SolveError> {
+        Ok(())
+    }
     fn solve(
         &mut self,
         request: SolveRequest,
@@ -154,11 +150,11 @@ mod tests {
     }
 
     #[test]
-    fn rejects_dangerous_work_configuration_centrally() {
+    fn rejects_invalid_work() {
         let mut request = SolveRequest {
             pre_pow: vec![0],
             nonce: 0,
-            job: None,
+            live_work: false,
             edge_bits: 32,
             cycle_length: 42,
             rounds: 0,
@@ -176,15 +172,11 @@ mod tests {
     }
 
     #[test]
-    fn work_request_derives_reference_keys_from_original_context() {
+    fn work_request_derives_keys() {
         let request = SolveRequest {
             pre_pow: vec![0],
             nonce: 45,
-            job: Some(JobContext {
-                height: 1,
-                job_id: 2,
-                difficulty: 3,
-            }),
+            live_work: true,
             edge_bits: 32,
             cycle_length: 42,
             rounds: 128,

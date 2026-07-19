@@ -1,14 +1,27 @@
-use std::{collections::HashMap, sync::Arc, time::Duration};
+use std::{
+    collections::HashMap,
+    io,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::Duration,
+};
 
 use anyhow::{Context, Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::{
-    io::{AsyncBufReadExt, AsyncWriteExt, BufReader, WriteHalf},
+    io::{AsyncBufRead, AsyncBufReadExt, AsyncWriteExt, BufReader, WriteHalf},
     net::TcpStream,
     sync::{Mutex, oneshot, watch},
+    task::JoinHandle,
     time::timeout,
 };
+
+const MAX_STRATUM_FRAME_BYTES: usize = 1024 * 1024;
+const RPC_LOW_DIFFICULTY: i64 = -32501;
+const RPC_SUBMITTED_TOO_LATE: i64 = -32503;
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 pub struct Job {
@@ -33,47 +46,123 @@ pub struct SubmitParams<'a> {
     pub pow: &'a [u64],
 }
 
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+pub struct RpcError {
+    pub code: i64,
+    pub message: String,
+    #[serde(default)]
+    pub data: Option<Value>,
+}
+
+impl RpcError {
+    pub fn is_expected_share_rejection(&self) -> bool {
+        matches!(self.code, RPC_LOW_DIFFICULTY | RPC_SUBMITTED_TOO_LATE)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum SubmitOutcome {
+    Accepted(Value),
+    Rejected(RpcError),
+}
+
 pub struct StratumClient {
+    host: String,
+    port: u16,
+    login: String,
+    password: String,
     writer: Arc<Mutex<WriteHalf<TcpStream>>>,
     pending: Arc<Mutex<HashMap<u64, oneshot::Sender<Value>>>>,
     next_id: u64,
     job_tx: watch::Sender<Option<Job>>,
     job_rx: watch::Receiver<Option<Job>>,
+    connected_tx: watch::Sender<bool>,
+    connected_rx: watch::Receiver<bool>,
+    reader_generation: Arc<AtomicU64>,
+    reader_task: Option<JoinHandle<()>>,
 }
 
 impl StratumClient {
     pub async fn connect(host: &str, port: u16, login: &str, password: &str) -> Result<Self> {
-        let stream = TcpStream::connect((host, port))
-            .await
-            .with_context(|| format!("connecting to {host}:{port}"))?;
-        stream.set_nodelay(true)?;
-        let (reader, writer) = tokio::io::split(stream);
+        let (reader, writer) = connect_stream(host, port).await?;
         let pending = Arc::new(Mutex::new(HashMap::new()));
         let (job_tx, job_rx) = watch::channel(None);
-        spawn_reader(reader, Arc::clone(&pending), job_tx.clone());
+        let (connected_tx, connected_rx) = watch::channel(false);
+        let reader_generation = Arc::new(AtomicU64::new(1));
+        let reader_task = spawn_reader(
+            reader,
+            Arc::clone(&pending),
+            job_tx.clone(),
+            connected_tx.clone(),
+            Arc::clone(&reader_generation),
+            1,
+        );
         let mut client = Self {
+            host: host.into(),
+            port,
+            login: login.into(),
+            password: password.into(),
             writer: Arc::new(Mutex::new(writer)),
             pending,
             next_id: 1,
             job_tx,
             job_rx,
+            connected_tx,
+            connected_rx,
+            reader_generation,
+            reader_task: Some(reader_task),
         };
-        let response = client
-            .request(
-                "login",
-                json!({
-                    "login": login,
-                    "pass": password,
-                    "agent": "grin-cuckatoo-rust/0.1"
-                }),
-            )
-            .await?;
-        ensure_ok(&response, "login")?;
+        client.connected_tx.send_replace(true);
+        if let Err(error) = client.login().await {
+            client.connected_tx.send_replace(false);
+            return Err(error);
+        }
         Ok(client)
     }
 
     pub fn job_updates(&self) -> watch::Receiver<Option<Job>> {
         self.job_rx.clone()
+    }
+
+    pub fn connection_updates(&self) -> watch::Receiver<bool> {
+        self.connected_rx.clone()
+    }
+
+    pub fn is_connected(&self) -> bool {
+        *self.connected_rx.borrow()
+    }
+
+    pub async fn reconnect(&mut self) -> Result<()> {
+        let generation = self.reader_generation.fetch_add(1, Ordering::AcqRel) + 1;
+        self.connected_tx.send_replace(false);
+        self.stop_reader().await;
+        let _ = self.writer.lock().await.shutdown().await;
+        self.pending.lock().await.clear();
+        let (reader, writer) = connect_stream(&self.host, self.port).await?;
+        let pending = Arc::new(Mutex::new(HashMap::new()));
+        self.writer = Arc::new(Mutex::new(writer));
+        self.pending = Arc::clone(&pending);
+        self.reader_task = Some(spawn_reader(
+            reader,
+            pending,
+            self.job_tx.clone(),
+            self.connected_tx.clone(),
+            Arc::clone(&self.reader_generation),
+            generation,
+        ));
+        self.connected_tx.send_replace(true);
+        if let Err(error) = self.login().await {
+            self.connected_tx.send_replace(false);
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    async fn stop_reader(&mut self) {
+        if let Some(task) = self.reader_task.take() {
+            task.abort();
+            let _ = task.await;
+        }
     }
 
     pub async fn get_job(&mut self) -> Result<Job> {
@@ -84,6 +173,7 @@ impl StratumClient {
         let job: Job =
             serde_json::from_value(response.get("result").cloned().unwrap_or(Value::Null))
                 .context("getjobtemplate returned no usable job")?;
+        job.pre_pow_bytes()?;
         if let Some(pushed) = self.job_rx.borrow().clone()
             && pushed.height > job.height
         {
@@ -93,14 +183,35 @@ impl StratumClient {
         Ok(job)
     }
 
-    pub async fn submit(&mut self, params: SubmitParams<'_>) -> Result<Value> {
+    pub async fn submit(&mut self, params: SubmitParams<'_>) -> Result<SubmitOutcome> {
         let response = self
             .request("submit", serde_json::to_value(params)?)
             .await?;
         if let Some(error) = response.get("error").filter(|value| !value.is_null()) {
-            return Err(anyhow!("share rejected: {error}"));
+            let error = serde_json::from_value(error.clone()).unwrap_or_else(|_| RpcError {
+                code: 0,
+                message: error.to_string(),
+                data: None,
+            });
+            return Ok(SubmitOutcome::Rejected(error));
         }
-        Ok(response.get("result").cloned().unwrap_or(Value::Null))
+        Ok(SubmitOutcome::Accepted(
+            response.get("result").cloned().unwrap_or(Value::Null),
+        ))
+    }
+
+    async fn login(&mut self) -> Result<()> {
+        let response = self
+            .request(
+                "login",
+                json!({
+                    "login": self.login,
+                    "pass": self.password,
+                    "agent": "grin-cuckatoo-rust/0.1"
+                }),
+            )
+            .await?;
+        ensure_ok(&response, "login")
     }
 
     async fn request(&mut self, method: &str, params: Value) -> Result<Value> {
@@ -134,26 +245,54 @@ impl StratumClient {
     }
 }
 
+impl Drop for StratumClient {
+    fn drop(&mut self) {
+        if let Some(task) = self.reader_task.take() {
+            task.abort();
+        }
+    }
+}
+
+async fn connect_stream(
+    host: &str,
+    port: u16,
+) -> Result<(tokio::io::ReadHalf<TcpStream>, WriteHalf<TcpStream>)> {
+    let stream = TcpStream::connect((host, port))
+        .await
+        .with_context(|| format!("connecting to {host}:{port}"))?;
+    stream.set_nodelay(true)?;
+    Ok(tokio::io::split(stream))
+}
+
 fn spawn_reader(
     reader: tokio::io::ReadHalf<TcpStream>,
     pending: Arc<Mutex<HashMap<u64, oneshot::Sender<Value>>>>,
     job_tx: watch::Sender<Option<Job>>,
-) {
+    connected_tx: watch::Sender<bool>,
+    reader_generation: Arc<AtomicU64>,
+    generation: u64,
+) -> JoinHandle<()> {
     tokio::spawn(async move {
-        let mut lines = BufReader::new(reader).lines();
+        let mut reader = BufReader::new(reader);
         loop {
-            let line = match lines.next_line().await {
-                Ok(Some(line)) => line,
+            if reader_generation.load(Ordering::Acquire) != generation {
+                break;
+            }
+            let frame = match read_frame(&mut reader).await {
+                Ok(Some(frame)) => frame,
                 Ok(None) => break,
                 Err(error) => {
                     eprintln!("Stratum reader error: {error}");
                     break;
                 }
             };
-            let value: Value = match serde_json::from_str(&line) {
+            if reader_generation.load(Ordering::Acquire) != generation {
+                break;
+            }
+            let value: Value = match serde_json::from_slice(&frame) {
                 Ok(value) => value,
                 Err(error) => {
-                    eprintln!("invalid Stratum JSON ignored: {error}: {line}");
+                    eprintln!("invalid Stratum JSON ignored: {error}");
                     continue;
                 }
             };
@@ -162,10 +301,14 @@ fn spawn_reader(
                     .get("params")
                     .cloned()
                     .ok_or_else(|| anyhow!("job push has no params"))
-                    .and_then(|params| serde_json::from_value(params).map_err(Into::into))
+                    .and_then(|params| serde_json::from_value::<Job>(params).map_err(Into::into))
                 {
                     Ok(job) => {
-                        job_tx.send_replace(Some(job));
+                        if let Err(error) = job.pre_pow_bytes() {
+                            eprintln!("invalid Stratum job push ignored: {error}");
+                        } else {
+                            job_tx.send_replace(Some(job));
+                        }
                     }
                     Err(error) => eprintln!("invalid Stratum job push ignored: {error}"),
                 }
@@ -182,7 +325,41 @@ fn spawn_reader(
             }
         }
         pending.lock().await.clear();
-    });
+        if reader_generation.load(Ordering::Acquire) == generation {
+            connected_tx.send_replace(false);
+        }
+    })
+}
+
+async fn read_frame<R: AsyncBufRead + Unpin>(reader: &mut R) -> io::Result<Option<Vec<u8>>> {
+    let mut frame = Vec::new();
+    loop {
+        let available = reader.fill_buf().await?;
+        if available.is_empty() {
+            return if frame.is_empty() {
+                Ok(None)
+            } else {
+                Ok(Some(frame))
+            };
+        }
+        let newline = available.iter().position(|byte| *byte == b'\n');
+        let take = newline.map_or(available.len(), |position| position + 1);
+        if frame.len() + take > MAX_STRATUM_FRAME_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Stratum frame exceeds 1 MiB",
+            ));
+        }
+        frame.extend_from_slice(&available[..take]);
+        reader.consume(take);
+        if newline.is_some() {
+            frame.pop();
+            if frame.last() == Some(&b'\r') {
+                frame.pop();
+            }
+            return Ok(Some(frame));
+        }
+    }
 }
 
 fn ensure_ok(response: &Value, operation: &str) -> Result<()> {
@@ -214,7 +391,7 @@ mod tests {
     }
 
     #[test]
-    fn submit_shape_uses_decimal_nonce_and_array() {
+    fn submit_uses_decimal_nonce() {
         let proof = vec![1, 2, 3, 4];
         let value = serde_json::to_value(SubmitParams {
             edge_bits: 10,
@@ -229,7 +406,100 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn background_reader_publishes_job_pushes_without_a_request() {
+    async fn oversized_frame_is_rejected() {
+        let bytes = vec![b'x'; MAX_STRATUM_FRAME_BYTES + 1];
+        let mut reader = BufReader::new(bytes.as_slice());
+        let error = read_frame(&mut reader).await.unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[tokio::test]
+    async fn rejection_is_an_outcome() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (reader, mut writer) = tokio::io::split(stream);
+            let mut lines = BufReader::new(reader).lines();
+            let login: Value =
+                serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
+            write_response(&mut writer, &login["id"], json!("ok"), Value::Null).await;
+            let submit: Value =
+                serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
+            write_response(
+                &mut writer,
+                &submit["id"],
+                Value::Null,
+                json!({"code": -32503, "message": "Solution Submitted too late"}),
+            )
+            .await;
+        });
+
+        let mut client = StratumClient::connect("127.0.0.1", address.port(), "test", "x")
+            .await
+            .unwrap();
+        let proof = [1, 2, 3, 4];
+        let outcome = client
+            .submit(SubmitParams {
+                edge_bits: 10,
+                height: 9,
+                job_id: 2,
+                nonce: 42,
+                pow: &proof,
+            })
+            .await
+            .unwrap();
+        assert!(matches!(
+            outcome,
+            SubmitOutcome::Rejected(RpcError { code: -32503, .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn reconnect_closes_old_reader() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (closed_tx, closed_rx) = oneshot::channel();
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (reader, mut writer) = tokio::io::split(stream);
+            let mut lines = BufReader::new(reader).lines();
+            let login: Value =
+                serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
+            write_response(&mut writer, &login["id"], json!("ok"), Value::Null).await;
+            assert!(lines.next_line().await.unwrap().is_none());
+            closed_tx.send(()).unwrap();
+
+            let (stream, _) = listener.accept().await.unwrap();
+            let (reader, mut writer) = tokio::io::split(stream);
+            let mut lines = BufReader::new(reader).lines();
+            let login: Value =
+                serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
+            write_response(&mut writer, &login["id"], json!("ok"), Value::Null).await;
+            let getjob: Value =
+                serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
+            write_response(
+                &mut writer,
+                &getjob["id"],
+                json!({"height": 10, "job_id": 0, "difficulty": 1, "pre_pow": "00"}),
+                Value::Null,
+            )
+            .await;
+        });
+
+        let mut client = StratumClient::connect("127.0.0.1", address.port(), "test", "x")
+            .await
+            .unwrap();
+        client.reconnect().await.unwrap();
+        timeout(Duration::from_secs(2), closed_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(client.get_job().await.unwrap().height, 10);
+    }
+
+    #[tokio::test]
+    async fn reader_publishes_job_push() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let (push_tx, push_rx) = oneshot::channel();
@@ -273,6 +543,22 @@ mod tests {
             writer
                 .write_all(
                     format!(
+                        "{}\n{}\n",
+                        json!({
+                            "id": "Stratum",
+                            "jsonrpc": "2.0",
+                            "method": "job",
+                            "params": {"height": 99, "job_id": 0, "difficulty": 1, "pre_pow": "zz"}
+                        }),
+                        json!({"id": 9999, "jsonrpc": "2.0", "result": "ignored"})
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+            writer
+                .write_all(
+                    format!(
                         "{}\n",
                         json!({
                             "id": "Stratum",
@@ -308,5 +594,23 @@ mod tests {
         })
         .await
         .expect("height-11 push was not published before timeout");
+    }
+
+    async fn write_response(
+        writer: &mut WriteHalf<TcpStream>,
+        id: &Value,
+        result: Value,
+        error: Value,
+    ) {
+        writer
+            .write_all(
+                format!(
+                    "{}\n",
+                    json!({"id": id, "jsonrpc": "2.0", "result": result, "error": error})
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
     }
 }

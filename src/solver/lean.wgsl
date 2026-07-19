@@ -1,6 +1,4 @@
-// The slean phase is a clean-room WGSL implementation derived from the
-// algorithm in Cuckatoo Reference Miner.
-// Copyright 2025-2026 Nicolas Flamel; used under the MIT License.
+// Slean implementation based on the Cuckatoo reference algorithm.
 
 struct U64 {
     lo: u32,
@@ -22,9 +20,9 @@ struct Params {
     edge_count_lo: u32,
     word_count: u32,
     node_mask: u32,
-    diagnostic_chunk_base: u32,
-    diagnostic_chunk_count: u32,
-    diagnostic_bucket: u32,
+    chunk_base: u32,
+    chunk_count: u32,
+    bucket_config: u32,
 }
 
 @group(0) @binding(0) var<uniform> params: Params;
@@ -44,12 +42,9 @@ struct Params {
 @group(3) @binding(2) var<storage, read_write> fine_next_arena: array<u32>;
 var<workgroup> survivor_count_scratch: array<u32, 256>;
 var<workgroup> fine_seen: array<atomic<u32>, 4096>;
-// Slean targets LOCAL_RAM_KILOBYTES=32. Entry points using this array own one
-// complete endpoint bucket; other kernels don't include it in their workgroup
-// storage footprint.
+// One workgroup owns a complete 32 KiB endpoint bucket.
 var<workgroup> slean_seen: array<atomic<u32>, 8192>;
-// Rounds 0--1 use a 14-bit bucket prefix. The remaining 18 endpoint bits
-// occupy exactly the adapter's 32 KiB workgroup-storage budget at C32.
+// A 14-bit prefix leaves a 32 KiB endpoint bitmap at C32.
 var<workgroup> coarse_stage_counts: array<atomic<u32>, 64>;
 var<workgroup> coarse_stage_bases: array<u32, 64>;
 fn add64(a: U64, b: U64) -> U64 {
@@ -94,9 +89,7 @@ fn sip_round(input: SipState) -> SipState {
     return v;
 }
 
-// The endpoint generator consumes only the low 32 bits of v0^v1^v2^v3.
-// In the last SipHash round several high-half terms cancel exactly. This is
-// the demanded-bits lowering used by the verified Metal reference miner.
+// Endpoint generation only needs the low 32 hash bits.
 fn sip_final_low(v: SipState) -> u32 {
     let b0 = add64(v.v0, v.v1);
     let b2 = add64(v.v2, v.v3);
@@ -161,8 +154,8 @@ fn clear_nodes(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workg
     }
 }
 
-// Diagnostic kernel: one endpoint hash per edge, register-only accumulation,
-// and one coalesced store per invocation. It deliberately does no graph work.
+// DIAGNOSTIC_KERNEL_BEGIN
+// Measures endpoint hashing without graph work.
 @compute @workgroup_size(256)
 fn siphash_only(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) groups: vec3<u32>) {
     if gid.x >= params.word_count { return; }
@@ -183,11 +176,9 @@ fn siphash_only(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_work
     }
     atomicStore(&edges[gid.x], accumulator);
 }
+// DIAGNOSTIC_KERNEL_END
 
-// Diagnostic exact popcount of the alive-edge bitmap. Each invocation reduces
-// its strided words locally, then one lane per workgroup updates the global
-// counter in bucket_scratch[0]. Checkpoints occur only after trimming, so the
-// C32 count is below the u32 overflow point.
+// Counts live edges into bucket_scratch[0].
 @compute @workgroup_size(256)
 fn count_alive_edges(
     @builtin(global_invocation_id) gid: vec3<u32>,
@@ -403,9 +394,7 @@ fn fine_trim_scatter(
     }
 }
 
-// Production one-pass counterpart of fine_trim_count + fine_trim_scatter.
-// Output offsets describe fixed-capacity bucket segments. Overflow is never
-// accepted: bucket_scratch[0] triggers the exact two-pass fallback on the host.
+// One-pass fine trim. Overflow triggers the exact host fallback.
 @compute @workgroup_size(256)
 fn fine_trim_fixed(
     @builtin(local_invocation_id) lid: vec3<u32>,
@@ -452,6 +441,7 @@ fn fine_trim_fixed(
     }
 }
 
+// DIAGNOSTIC_KERNEL_BEGIN
 @compute @workgroup_size(256)
 fn fine_emit_bitmap(
     @builtin(local_invocation_id) lid: vec3<u32>,
@@ -482,10 +472,10 @@ fn compare_edge_node_bitmaps(@builtin(global_invocation_id) gid: vec3<u32>, @bui
         word += stride;
     }
 }
+// DIAGNOSTIC_KERNEL_END
 
-// Diagnostic baseline for round-0 marking. All edges are alive, so reading the
-// initialized edge bitmap would add no information. This isolates endpoint
-// generation plus the real random node-bitmap atomics.
+// DIAGNOSTIC_KERNEL_BEGIN
+// Round-zero marking diagnostic.
 @compute @workgroup_size(256)
 fn dense_mark_nodes(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) groups: vec3<u32>) {
     let stride = groups.x * 256u;
@@ -504,38 +494,36 @@ fn dense_mark_nodes(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_
         word += stride;
     }
 }
+// DIAGNOSTIC_KERNEL_END
 
-// Chunked round-0 bucketing diagnostic. Header words 0..bucket_count-1 are
-// counters and word 128 is a persistent overflow counter. Bucket payload starts
-// at word 256. C32 is split into 16 chunks of 2^28 edges. The bucket count is
-// packed into the high 16 bits of diagnostic_bucket; its low bits select the
-// bucket for the marking kernel.
+// Chunked round-zero bucketing diagnostic.
 const DIAGNOSTIC_BUCKET_HEADER_WORDS: u32 = 256u;
 const DIAGNOSTIC_BUCKET_OVERFLOW_WORD: u32 = 128u;
 const DIAGNOSTIC_BUCKET_MARGIN: u32 = 1u << 16u;
 
-fn diagnostic_bucket_count() -> u32 {
-    return params.diagnostic_bucket >> 16u;
+fn bucket_config_count() -> u32 {
+    return params.bucket_config >> 16u;
 }
 
-fn diagnostic_bucket_capacity() -> u32 {
-    let buckets = diagnostic_bucket_count();
-    return (params.diagnostic_chunk_count + buckets - 1u) / buckets
+fn bucket_config_capacity() -> u32 {
+    let buckets = bucket_config_count();
+    return (params.chunk_count + buckets - 1u) / buckets
         + DIAGNOSTIC_BUCKET_MARGIN;
 }
 
+// DIAGNOSTIC_KERNEL_BEGIN
 @compute @workgroup_size(256)
 fn bucket_scatter_nodes(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) groups: vec3<u32>) {
     let stride = groups.x * 256u;
     var local_edge = gid.x;
     loop {
-        if local_edge >= params.diagnostic_chunk_count { break; }
-        let edge = params.diagnostic_chunk_base + local_edge;
+        if local_edge >= params.chunk_count { break; }
+        let edge = params.chunk_base + local_edge;
         let node = endpoint(edge);
-        let bucket_count = diagnostic_bucket_count();
+        let bucket_count = bucket_config_count();
         let bucket_bits = countOneBits(bucket_count - 1u);
         let bucket = node >> (params.edge_bits - bucket_bits);
-        let bucket_capacity = diagnostic_bucket_capacity();
+        let bucket_capacity = bucket_config_capacity();
         let slot = atomicAdd(&bucket_scratch[bucket], 1u);
         if slot < bucket_capacity {
             let output = DIAGNOSTIC_BUCKET_HEADER_WORDS
@@ -547,10 +535,9 @@ fn bucket_scatter_nodes(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(
         local_edge += stride;
     }
 }
+// DIAGNOSTIC_KERNEL_END
 
-// Production dense-round reservation staging. Each threadgroup first counts
-// its 256 destinations locally, then performs at most one contended global
-// reservation per bucket. The original path did one global atomicAdd per edge.
+// Reserve dense-round bucket space once per workgroup.
 @compute @workgroup_size(256)
 fn bucket_scatter_dense_nodes_staged(
     @builtin(local_invocation_id) lid: vec3<u32>,
@@ -558,10 +545,10 @@ fn bucket_scatter_dense_nodes_staged(
     @builtin(num_workgroups) groups: vec3<u32>,
 ) {
     let stride = groups.x * 256u;
-    let iterations = (params.diagnostic_chunk_count + stride - 1u) / stride;
-    let bucket_count = diagnostic_bucket_count();
+    let iterations = (params.chunk_count + stride - 1u) / stride;
+    let bucket_count = bucket_config_count();
     let bucket_bits = countOneBits(bucket_count - 1u);
-    let capacity = diagnostic_bucket_capacity();
+    let capacity = bucket_config_capacity();
     var iteration = 0u;
     loop {
         if iteration >= iterations { break; }
@@ -570,12 +557,12 @@ fn bucket_scatter_dense_nodes_staged(
         }
         workgroupBarrier();
         let local_edge = group.x * 256u + lid.x + iteration * stride;
-        let live = local_edge < params.diagnostic_chunk_count;
+        let live = local_edge < params.chunk_count;
         var node = 0u;
         var bucket = 0u;
         var local_slot = 0u;
         if live {
-            node = endpoint(params.diagnostic_chunk_base + local_edge);
+            node = endpoint(params.chunk_base + local_edge);
             bucket = node >> (params.edge_bits - bucket_bits);
             local_slot = atomicAdd(&coarse_stage_counts[bucket], 1u);
         }
@@ -601,8 +588,8 @@ fn bucket_scatter_dense_nodes_staged(
 
 @compute @workgroup_size(256)
 fn bucket_mark_nodes(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) groups: vec3<u32>) {
-    let bucket = params.diagnostic_bucket & 0xffffu;
-    let bucket_capacity = diagnostic_bucket_capacity();
+    let bucket = params.bucket_config & 0xffffu;
+    let bucket_capacity = bucket_config_capacity();
     let count = min(atomicLoad(&bucket_scratch[bucket]), bucket_capacity);
     let start = DIAGNOSTIC_BUCKET_HEADER_WORDS + bucket * bucket_capacity;
     let stride = groups.x * 256u;
@@ -615,12 +602,11 @@ fn bucket_mark_nodes(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num
     }
 }
 
-// Production counterpart of bucket_scatter_nodes: enumerate only live edges
-// in the selected edge range. The edge bitmap remains untouched.
+// Scatter live edges from the selected range.
 @compute @workgroup_size(256)
 fn bucket_scatter_alive_nodes(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) groups: vec3<u32>) {
-    let first_word = params.diagnostic_chunk_base >> 5u;
-    let chunk_words = (params.diagnostic_chunk_count + 31u) >> 5u;
+    let first_word = params.chunk_base >> 5u;
+    let chunk_words = (params.chunk_count + 31u) >> 5u;
     let stride = groups.x * 256u;
     var local_word = gid.x;
     loop {
@@ -630,13 +616,13 @@ fn bucket_scatter_alive_nodes(@builtin(global_invocation_id) gid: vec3<u32>, @bu
         while bits != 0u {
             let bit = firstTrailingBit(bits);
             let edge = word * 32u + bit;
-            if edge >= params.diagnostic_chunk_base
-                && edge - params.diagnostic_chunk_base < params.diagnostic_chunk_count {
+            if edge >= params.chunk_base
+                && edge - params.chunk_base < params.chunk_count {
                 let node = endpoint(edge);
-                let bucket_count = diagnostic_bucket_count();
+                let bucket_count = bucket_config_count();
                 let bucket_bits = countOneBits(bucket_count - 1u);
                 let bucket = node >> (params.edge_bits - bucket_bits);
-                let bucket_capacity = diagnostic_bucket_capacity();
+                let bucket_capacity = bucket_config_capacity();
                 let slot = atomicAdd(&bucket_scratch[bucket], 1u);
                 if slot < bucket_capacity {
                     let output = DIAGNOSTIC_BUCKET_HEADER_WORDS
@@ -652,14 +638,11 @@ fn bucket_scatter_alive_nodes(@builtin(global_invocation_id) gid: vec3<u32>, @bu
     }
 }
 
-// Second phase of the production bucket path. Marking must finish over every
-// edge chunk before trimming is sound, so this pass re-enumerates one chunk and
-// retains both the endpoint and its edge index. The doubled payload still fits
-// because only one 2^26-edge chunk is resident at a time.
+// Re-enumerate one chunk after marking and retain its edge indexes.
 @compute @workgroup_size(256)
 fn bucket_scatter_alive_pairs(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) groups: vec3<u32>) {
-    let first_word = params.diagnostic_chunk_base >> 5u;
-    let chunk_words = (params.diagnostic_chunk_count + 31u) >> 5u;
+    let first_word = params.chunk_base >> 5u;
+    let chunk_words = (params.chunk_count + 31u) >> 5u;
     let stride = groups.x * 256u;
     var local_word = gid.x;
     loop {
@@ -669,13 +652,13 @@ fn bucket_scatter_alive_pairs(@builtin(global_invocation_id) gid: vec3<u32>, @bu
         while bits != 0u {
             let bit = firstTrailingBit(bits);
             let edge = word * 32u + bit;
-            if edge >= params.diagnostic_chunk_base
-                && edge - params.diagnostic_chunk_base < params.diagnostic_chunk_count {
+            if edge >= params.chunk_base
+                && edge - params.chunk_base < params.chunk_count {
                 let node = endpoint(edge);
-                let bucket_count = diagnostic_bucket_count();
+                let bucket_count = bucket_config_count();
                 let bucket_bits = countOneBits(bucket_count - 1u);
                 let bucket = node >> (params.edge_bits - bucket_bits);
-                let bucket_capacity = diagnostic_bucket_capacity();
+                let bucket_capacity = bucket_config_capacity();
                 let slot = atomicAdd(&bucket_scratch[bucket], 1u);
                 if slot < bucket_capacity {
                     let output = DIAGNOSTIC_BUCKET_HEADER_WORDS
@@ -699,10 +682,10 @@ fn bucket_scatter_dense_pairs_staged(
     @builtin(num_workgroups) groups: vec3<u32>,
 ) {
     let stride = groups.x * 256u;
-    let iterations = (params.diagnostic_chunk_count + stride - 1u) / stride;
-    let bucket_count = diagnostic_bucket_count();
+    let iterations = (params.chunk_count + stride - 1u) / stride;
+    let bucket_count = bucket_config_count();
     let bucket_bits = countOneBits(bucket_count - 1u);
-    let capacity = diagnostic_bucket_capacity();
+    let capacity = bucket_config_capacity();
     var iteration = 0u;
     loop {
         if iteration >= iterations { break; }
@@ -711,13 +694,13 @@ fn bucket_scatter_dense_pairs_staged(
         }
         workgroupBarrier();
         let local_edge = group.x * 256u + lid.x + iteration * stride;
-        let live = local_edge < params.diagnostic_chunk_count;
+        let live = local_edge < params.chunk_count;
         var edge = 0u;
         var node = 0u;
         var bucket = 0u;
         var local_slot = 0u;
         if live {
-            edge = params.diagnostic_chunk_base + local_edge;
+            edge = params.chunk_base + local_edge;
             node = endpoint(edge);
             bucket = node >> (params.edge_bits - bucket_bits);
             local_slot = atomicAdd(&coarse_stage_counts[bucket], 1u);
@@ -745,14 +728,12 @@ fn bucket_scatter_dense_pairs_staged(
 
 @compute @workgroup_size(256)
 fn bucket_trim_pairs(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) groups: vec3<u32>) {
-    // The host reads overflow only after mark and trim have both been queued.
-    // A lossy bucket therefore never mutates the edge bitmap; the host follows
-    // with the exact direct fallback for the complete round.
+    // Overflow leaves the edge bitmap untouched for the exact fallback.
     if atomicLoad(&bucket_scratch[DIAGNOSTIC_BUCKET_OVERFLOW_WORD]) != 0u {
         return;
     }
-    let bucket = params.diagnostic_bucket & 0xffffu;
-    let bucket_capacity = diagnostic_bucket_capacity();
+    let bucket = params.bucket_config & 0xffffu;
+    let bucket_capacity = bucket_config_capacity();
     let count = min(atomicLoad(&bucket_scratch[bucket]), bucket_capacity);
     let start = DIAGNOSTIC_BUCKET_HEADER_WORDS + 2u * bucket * bucket_capacity;
     let stride = groups.x * 256u;
@@ -770,18 +751,17 @@ fn bucket_trim_pairs(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num
     }
 }
 
-// Clean-room WGSL slean seed/trim derived from the part and local-bitmap
-// structure of Nicolas Flamel's MIT-licensed Cuckatoo Reference Miner.
+// Slean seed and trim kernels.
 fn slean_header_words() -> u32 {
-    return diagnostic_bucket_count() / 4u + 1u;
+    return bucket_config_count() / 4u + 1u;
 }
 
 fn slean_overflow_word() -> u32 {
-    return diagnostic_bucket_count() / 4u;
+    return bucket_config_count() / 4u;
 }
 
 fn slean_shard_width() -> u32 {
-    return diagnostic_bucket_count() / 4u;
+    return bucket_config_count() / 4u;
 }
 
 fn slean_count_add(shard: u32, index: u32, value: u32) -> u32 {
@@ -812,25 +792,27 @@ fn slean_has_overflow() -> bool {
 }
 
 fn slean_capacity() -> u32 {
-    if (params.diagnostic_bucket & 1u) != 0u {
+    // The host uses the same 5% margin and 64-edge reserve in slean_sizing().
+    // The low config bit is reserved for the overflow regression test.
+    if (params.bucket_config & 1u) != 0u {
         return 1u;
     }
-    let base = (params.diagnostic_chunk_count + diagnostic_bucket_count() - 1u)
-        / diagnostic_bucket_count();
+    let base = (params.chunk_count + bucket_config_count() - 1u)
+        / bucket_config_count();
     return base + (base + 19u) / 20u + 64u;
 }
 
 fn slean_bucket(node: u32) -> u32 {
-    let bits = countOneBits(diagnostic_bucket_count() - 1u);
+    let bits = countOneBits(bucket_config_count() - 1u);
     return node >> (params.edge_bits - bits);
 }
 
 fn slean_bucket_words() -> u32 {
-    return params.word_count / diagnostic_bucket_count();
+    return params.word_count / bucket_config_count();
 }
 
 fn slean_dead_bucket_count() -> u32 {
-    return ((params.diagnostic_chunk_count + 31u) >> 5u) / slean_bucket_words();
+    return ((params.chunk_count + 31u) >> 5u) / slean_bucket_words();
 }
 
 fn slean_dead_header_words() -> u32 {
@@ -842,7 +824,7 @@ fn slean_dead_overflow_word() -> u32 {
 }
 
 fn slean_dead_capacity() -> u32 {
-    let base = (params.diagnostic_chunk_count + slean_dead_bucket_count() - 1u)
+    let base = (params.chunk_count + slean_dead_bucket_count() - 1u)
         / slean_dead_bucket_count();
     return (base * 45u + 99u) / 100u + 64u;
 }
@@ -871,8 +853,8 @@ fn slean_scatter_dense(
     let stride = groups.x * 256u;
     var local_edge = gid.x;
     loop {
-        if local_edge >= params.diagnostic_chunk_count { break; }
-        slean_scatter_edge(params.diagnostic_chunk_base + local_edge);
+        if local_edge >= params.chunk_count { break; }
+        slean_scatter_edge(params.chunk_base + local_edge);
         local_edge += stride;
     }
 }
@@ -882,8 +864,8 @@ fn slean_scatter_alive(
     @builtin(global_invocation_id) gid: vec3<u32>,
     @builtin(num_workgroups) groups: vec3<u32>,
 ) {
-    let first_word = params.diagnostic_chunk_base >> 5u;
-    let chunk_words = (params.diagnostic_chunk_count + 31u) >> 5u;
+    let first_word = params.chunk_base >> 5u;
+    let chunk_words = (params.chunk_count + 31u) >> 5u;
     let stride = groups.x * 256u;
     var local_word = gid.x;
     loop {
@@ -893,8 +875,8 @@ fn slean_scatter_alive(
         while bits != 0u {
             let bit = firstTrailingBit(bits);
             let edge = word * 32u + bit;
-            if edge >= params.diagnostic_chunk_base
-                && edge - params.diagnostic_chunk_base < params.diagnostic_chunk_count {
+            if edge >= params.chunk_base
+                && edge - params.chunk_base < params.chunk_count {
                 slean_scatter_edge(edge);
             }
             bits &= bits - 1u;
@@ -909,7 +891,7 @@ fn slean_mark_buckets(
     @builtin(workgroup_id) group: vec3<u32>,
 ) {
     let bucket = group.x;
-    if bucket >= diagnostic_bucket_count() { return; }
+    if bucket >= bucket_config_count() { return; }
     let words = slean_bucket_words();
     var word = lid.x;
     loop {
@@ -940,9 +922,7 @@ fn slean_mark_buckets(
         if word >= words { break; }
         let marked = atomicLoad(&slean_seen[word]);
         if marked != 0u {
-            // One workgroup exclusively owns this global word in a dispatch,
-            // and parts are submitted in order. Avoid a global atomic RMW;
-            // preserve marks from earlier parts with an ordered load/store.
+            // Parts are ordered, so an ordinary load/store preserves old marks.
             let index = global_start + word;
             atomicStore(&nodes[index], atomicLoad(&nodes[index]) | marked);
         }
@@ -957,7 +937,7 @@ fn slean_trim_buckets(
 ) {
     if slean_has_overflow() { return; }
     let bucket = group.x;
-    if bucket >= diagnostic_bucket_count() { return; }
+    if bucket >= bucket_config_count() { return; }
     let words = slean_bucket_words();
     let global_start = bucket * words;
     var word = lid.x;
@@ -980,7 +960,7 @@ fn slean_trim_buckets(
         let node = endpoint(edge);
         let mate = (node ^ 1u) & (words * 32u - 1u);
         if (atomicLoad(&slean_seen[mate >> 5u]) & (1u << (mate & 31u))) == 0u {
-            let local_edge = edge - params.diagnostic_chunk_base;
+            let local_edge = edge - params.chunk_base;
             let dead_bucket = local_edge / (words * 32u);
             let dead_slot = atomicAdd(&slean_dead_scratch[dead_bucket], 1u);
             let dead_capacity = slean_dead_capacity();
@@ -999,10 +979,7 @@ fn slean_trim_buckets(
     }
 }
 
-// Flamel step four: the final part is still resident after the global mark
-// sweep. Merge its marks into the bitmap and trim it in one workgroup pass,
-// instead of clearing/filling shared memory for mark and immediately loading
-// the same 32 KiB window again for trim.
+// Merge and trim the final resident part in one pass.
 @compute @workgroup_size(256)
 fn slean_mark_and_trim_final_part(
     @builtin(local_invocation_id) lid: vec3<u32>,
@@ -1010,7 +987,7 @@ fn slean_mark_and_trim_final_part(
 ) {
     if slean_has_overflow() { return; }
     let bucket = group.x;
-    if bucket >= diagnostic_bucket_count() { return; }
+    if bucket >= bucket_config_count() { return; }
     let words = slean_bucket_words();
     let global_start = bucket * words;
     var word = lid.x;
@@ -1054,7 +1031,7 @@ fn slean_mark_and_trim_final_part(
         let node = endpoint(edge);
         let mate = (node ^ 1u) & (words * 32u - 1u);
         if (atomicLoad(&slean_seen[mate >> 5u]) & (1u << (mate & 31u))) == 0u {
-            let local_edge = edge - params.diagnostic_chunk_base;
+            let local_edge = edge - params.chunk_base;
             let dead_bucket = local_edge / (words * 32u);
             let dead_slot = atomicAdd(&slean_dead_scratch[dead_bucket], 1u);
             let dead_capacity = slean_dead_capacity();
@@ -1083,7 +1060,7 @@ fn slean_apply_deaths(
     let bucket = group.x;
     if bucket >= slean_dead_bucket_count() { return; }
     let words = slean_bucket_words();
-    let first_word = (params.diagnostic_chunk_base >> 5u) + bucket * words;
+    let first_word = (params.chunk_base >> 5u) + bucket * words;
     var word = lid.x;
     loop {
         if word >= words { break; }
@@ -1098,7 +1075,7 @@ fn slean_apply_deaths(
     loop {
         if slot >= count { break; }
         let edge = atomicLoad(&slean_dead_scratch[start + slot]);
-        let local_bit = edge - params.diagnostic_chunk_base - bucket * words * 32u;
+        let local_bit = edge - params.chunk_base - bucket * words * 32u;
         atomicAnd(&slean_seen[local_bit >> 5u], ~(1u << (local_bit & 31u)));
         slot += 256u;
     }

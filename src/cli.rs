@@ -7,7 +7,8 @@ pub enum Backend {
     Auto,
     Metal,
     Cpu,
-    Gpu,
+    #[value(alias = "gpu")]
+    Wgpu,
 }
 
 #[derive(Debug, Parser)]
@@ -31,7 +32,7 @@ pub struct SolverArgs {
         long,
         value_enum,
         default_value_t = Backend::Auto,
-        help = "Solver backend; auto selects native Metal on macOS when available, then wgpu, then CPU"
+        help = "Solver backend; auto selects native Metal on macOS when available, then wgpu, then CPU for C28 and smaller"
     )]
     pub backend: Backend,
     #[arg(long, default_value_t = 32, value_parser = clap::value_parser!(u8).range(1..=32))]
@@ -106,4 +107,20 @@ pub struct GateArgs {
     pub nonce_start: u64,
     #[arg(long, default_value_t = 100)]
     pub count: u64,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn gpu_is_a_wgpu_alias() {
+        for name in ["wgpu", "gpu"] {
+            let cli = Cli::try_parse_from(["miner", "gate", "--backend", name]).unwrap();
+            let Command::Gate(args) = cli.command else {
+                unreachable!();
+            };
+            assert!(matches!(args.solver.backend, Backend::Wgpu));
+        }
+    }
 }

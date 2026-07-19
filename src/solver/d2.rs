@@ -28,8 +28,7 @@ struct DfsState<'a> {
     branches: &'a mut u64,
 }
 
-/// Exact post-trim verdict. Every 42-cycle induces a vertex-simple closed
-/// 21-step walk where each arc advances through one U mate and one V mate.
+/// Finds an exact cycle in the trimmed graph.
 pub(crate) fn find_cycle_d2(
     request: GraphParams,
     survivors: &[u64],
@@ -194,7 +193,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn radix_order_matches_standard_sort() {
+    fn radix_matches_sort() {
         let keys = [7, 1, u32::MAX, 7, 0, 65_537, 1];
         let order = radix_order(&keys);
         let sorted: Vec<_> = order.iter().map(|&i| keys[i as usize]).collect();

@@ -1,32 +1,16 @@
 use super::*;
 
-pub(super) const BUCKET_HEADER_WORDS: u64 = 256;
-pub(super) const BUCKET_OVERFLOW_WORD: u64 = 128;
-pub(super) const BUCKET_MARGIN: u64 = 1 << 16;
-
-#[derive(Clone, Copy)]
-pub(super) struct Diagnostics {
-    pub per_round: bool,
-    pub siphash_only: bool,
-    pub bucket_round0: bool,
-    pub survivor_counts: bool,
-    pub early_phases: bool,
-    pub slean_phases: bool,
-    pub fine_csr: bool,
-    pub fine_end_round: u32,
-    pub bucket_count: u32,
-    pub mask_bits: Option<u8>,
-    pub rounds: u32,
-}
-
 impl Diagnostics {
     pub fn result_only_from_env() -> bool {
+        if !cfg!(any(test, feature = "diagnostics")) {
+            return false;
+        }
         [
-            "GRIN_MINER_DIAGNOSTIC_NODE_MASK_BITS",
-            "GRIN_MINER_DIAGNOSTIC_SIPHASH_ONLY",
-            "GRIN_MINER_DIAGNOSTIC_BUCKET_ROUND0",
-            "GRIN_MINER_DIAGNOSTIC_SURVIVOR_COUNTS",
-            "GRIN_MINER_DIAGNOSTIC_FINE_CSR",
+            NODE_MASK_BITS,
+            SIPHASH_ONLY,
+            BUCKET_ROUND0,
+            SURVIVOR_COUNTS,
+            FINE_CSR,
         ]
         .into_iter()
         .any(env_flag)
@@ -37,23 +21,38 @@ impl Diagnostics {
         rounds: u32,
         fine_end_override: Option<u32>,
     ) -> Result<Self, SolveError> {
-        let siphash_only = env_flag("GRIN_MINER_DIAGNOSTIC_SIPHASH_ONLY");
-        let bucket_round0 = env_flag("GRIN_MINER_DIAGNOSTIC_BUCKET_ROUND0");
-        let survivor_counts = env_flag("GRIN_MINER_DIAGNOSTIC_SURVIVOR_COUNTS");
-        let fine_csr = fine_end_override.is_some() || env_flag("GRIN_MINER_DIAGNOSTIC_FINE_CSR");
+        if !cfg!(any(test, feature = "diagnostics")) {
+            return Ok(Self {
+                per_round: false,
+                siphash_only: false,
+                bucket_round0: false,
+                survivor_counts: false,
+                early_phases: false,
+                slean_phases: false,
+                fine_csr: false,
+                fine_end_round: fine_end_override.unwrap_or(64),
+                bucket_count: 16,
+                mask_bits: None,
+                rounds,
+            });
+        }
+        let siphash_only = env_flag(SIPHASH_ONLY);
+        let bucket_round0 = env_flag(BUCKET_ROUND0);
+        let survivor_counts = env_flag(SURVIVOR_COUNTS);
+        let fine_csr = fine_end_override.is_some() || env_flag(FINE_CSR);
         let fine_end_round = fine_end_override
-            .or(parse_env("GRIN_MINER_DIAGNOSTIC_FINE_END_ROUND")?)
+            .or(parse_env(FINE_END_ROUND)?)
             .unwrap_or(64);
-        let bucket_count = parse_env("GRIN_MINER_DIAGNOSTIC_BUCKETS")?.unwrap_or(16);
-        let mask_bits = parse_env("GRIN_MINER_DIAGNOSTIC_NODE_MASK_BITS")?;
+        let bucket_count = parse_env(BUCKETS)?.unwrap_or(16);
+        let mask_bits = parse_env(NODE_MASK_BITS)?;
 
         let diagnostics = Self {
-            per_round: env_flag("GRIN_MINER_DIAGNOSTIC_PER_ROUND"),
+            per_round: env_flag(PER_ROUND),
             siphash_only,
             bucket_round0,
             survivor_counts,
-            early_phases: env_flag("GRIN_MINER_DIAGNOSTIC_EARLY_PHASES"),
-            slean_phases: env_flag("GRIN_MINER_DIAGNOSTIC_SLEAN_PHASES"),
+            early_phases: env_flag(EARLY_PHASES),
+            slean_phases: env_flag(SLEAN_PHASES),
             fine_csr,
             fine_end_round,
             bucket_count,
@@ -110,7 +109,7 @@ impl Diagnostics {
         if self.fine_csr && (exclusive != 0 || self.survivor_counts) {
             return invalid("FINE_CSR cannot be combined with another result-only GPU diagnostic");
         }
-        if !self.fine_csr && env_flag("GRIN_MINER_DIAGNOSTIC_FINE_END_ROUND") {
+        if !self.fine_csr && env_flag(FINE_END_ROUND) {
             return invalid(
                 "GRIN_MINER_DIAGNOSTIC_FINE_END_ROUND requires GRIN_MINER_DIAGNOSTIC_FINE_CSR",
             );
@@ -127,7 +126,7 @@ impl Diagnostics {
         if self.bucket_round0 && edge_bits != 32 {
             return invalid("GRIN_MINER_DIAGNOSTIC_BUCKET_ROUND0 currently requires edge_bits=32");
         }
-        if !self.bucket_round0 && env_flag("GRIN_MINER_DIAGNOSTIC_BUCKETS") {
+        if !self.bucket_round0 && env_flag(BUCKETS) {
             return invalid(
                 "GRIN_MINER_DIAGNOSTIC_BUCKETS requires GRIN_MINER_DIAGNOSTIC_BUCKET_ROUND0",
             );
@@ -217,9 +216,9 @@ impl GpuWgpuSolver {
             edge_count_lo: 0,
             word_count: (1_u64 << 27) as u32,
             node_mask: u32::MAX,
-            diagnostic_chunk_base: chunk_base,
-            diagnostic_chunk_count: chunk_count,
-            diagnostic_bucket: packed_bucket(bucket),
+            chunk_base,
+            chunk_count,
+            bucket_config: packed_bucket(bucket),
         };
         let make_bind_group = |label: &str, params: Params| {
             let uniform =

@@ -50,9 +50,13 @@ testnet mining. With a node listening on port `13416`:
 
 Use `--max-graphs 1` for a one-graph smoke test.
 
+Mining reconnects indefinitely, with a backoff capped at 30 seconds. If a
+submit connection drops, the share is not sent twice because delivery may
+already have succeeded.
+
 ## Important options
 
-- `--backend auto|metal|gpu|cpu`
+- `--backend auto|metal|wgpu|cpu` (`gpu` remains an alias for `wgpu`)
 - `--trimming auto|lean|slean`
 - `--slean-parts 4` for a typical 16 GB unified-memory machine
 - `--local-ram-kib 32`
@@ -62,10 +66,14 @@ Backend selection:
 
 - On macOS C18–C32, `--backend auto` with `--trimming auto` or `slean`
   selects native Metal slean.
-- `--backend gpu` with `--trimming auto` or `slean` selects portable wgpu
+- `--backend wgpu` with `--trimming auto` or `slean` selects portable wgpu
   slean.
-- `--trimming lean` uses portable wgpu with `--backend auto` or `gpu`.
-- Native Metal does not support lean; use `--backend gpu` instead.
+- `--trimming lean` uses portable wgpu with `--backend auto` or `wgpu`.
+- Native Metal does not support lean; use `--backend wgpu` instead.
+
+The CPU backend supports graphs up to C28. If no GPU is available, `auto`
+falls back to CPU only when the requested graph fits that limit; C32 reports a
+backend error immediately.
 
 On an M5 Air with 16 GB, C32/128 and `slean-parts=4` measured about
 7.2–7.4 s (0.135–0.139 G/s) with native Metal, 10.4 s (0.096 G/s) with
@@ -74,6 +82,14 @@ with a CPU fallback when no GPU is available.
 
 Arena overflow, cancellation, and inconclusive searches never produce or
 submit an unchecked proof.
+
+The node may publish several templates at the same height. Grin keeps their
+job IDs valid until the height changes, so an in-flight solve stays on its
+original template and switches immediately when a new height arrives.
+
+GPU diagnostics are development-only. Build with `--features diagnostics` to
+enable their environment-controlled paths; `mine` still rejects diagnostic
+variables to prevent accidental non-mining runs.
 
 ## License
 

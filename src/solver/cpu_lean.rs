@@ -84,7 +84,11 @@ fn trim_survivors_cancellable(
     max_edge_bits: u8,
     cancel: &AtomicBool,
 ) -> Result<Option<Vec<u64>>, SolveError> {
-    validate_request(request, max_edge_bits)?;
+    if request.edge_bits > max_edge_bits {
+        return Err(SolveError::Unsupported(format!(
+            "CPU backend is capped at edge_bits={max_edge_bits}; use --backend wgpu for C32"
+        )));
+    }
     let edge_count = 1_u64 << request.edge_bits;
     let word_count = usize::try_from(edge_count.div_ceil(64))
         .map_err(|_| SolveError::Unsupported("graph does not fit this CPU address space".into()))?;
@@ -136,35 +140,6 @@ fn trim_survivors_cancellable(
         }
     }
     Ok(Some(survivors))
-}
-
-pub(crate) fn validate_request(request: GraphParams, max_edge_bits: u8) -> Result<(), SolveError> {
-    if request.edge_bits == 0 || request.edge_bits > 32 {
-        return Err(SolveError::InvalidConfig(
-            "edge_bits must be in 1..=32".into(),
-        ));
-    }
-    if request.edge_bits > max_edge_bits {
-        return Err(SolveError::Unsupported(format!(
-            "CPU backend is capped at edge_bits={max_edge_bits}; use --backend gpu for C32"
-        )));
-    }
-    if request.cycle_length == 0 || !request.cycle_length.is_multiple_of(2) {
-        return Err(SolveError::InvalidConfig(
-            "cycle_length must be positive and even".into(),
-        ));
-    }
-    if request.cycle_length > 64 {
-        return Err(SolveError::InvalidConfig(
-            "cycle_length must not exceed 64".into(),
-        ));
-    }
-    if request.rounds == 0 {
-        return Err(SolveError::InvalidConfig(
-            "rounds must be at least 1".into(),
-        ));
-    }
-    Ok(())
 }
 
 pub(crate) fn find_cycle(
@@ -270,11 +245,11 @@ mod tests {
     use std::sync::atomic::AtomicBool;
 
     #[test]
-    fn small_graph_runs_and_any_result_verifies() {
+    fn small_graph_proofs_verify() {
         let request = SolveRequest {
             pre_pow: vec![0],
             nonce: 0,
-            job: None,
+            live_work: false,
             edge_bits: 12,
             cycle_length: 4,
             rounds: 20,
@@ -289,11 +264,11 @@ mod tests {
     }
 
     #[test]
-    fn invalid_edge_bits_are_rejected_before_allocating() {
+    fn rejects_edge_bits_before_allocating() {
         let request = SolveRequest {
             pre_pow: vec![0],
             nonce: 0,
-            job: None,
+            live_work: false,
             edge_bits: 0,
             cycle_length: 42,
             rounds: 160,
@@ -305,11 +280,11 @@ mod tests {
     }
 
     #[test]
-    fn pre_cancelled_work_returns_cancelled_outcome() {
+    fn pre_cancel_returns_cancelled() {
         let request = SolveRequest {
             pre_pow: vec![0],
             nonce: 0,
-            job: None,
+            live_work: false,
             edge_bits: 12,
             cycle_length: 4,
             rounds: 20,

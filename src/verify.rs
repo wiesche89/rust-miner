@@ -103,20 +103,6 @@ pub fn verify_cycle(
     Ok(())
 }
 
-pub fn graph_weight(height: u64, edge_bits: u8) -> u64 {
-    const YEAR_HEIGHT: u64 = 524_160;
-    const WEEK_HEIGHT: u64 = 10_080;
-    const BASE_EDGE_BITS: u8 = 24;
-    if edge_bits < BASE_EDGE_BITS {
-        return 0;
-    }
-    let mut adjusted = u64::from(edge_bits);
-    if edge_bits == 31 && height >= YEAR_HEIGHT {
-        adjusted = adjusted.saturating_sub(1 + (height - YEAR_HEIGHT) / WEEK_HEIGHT);
-    }
-    (2_u64 << (edge_bits - BASE_EDGE_BITS)) * adjusted
-}
-
 pub fn proof_hash(proof: &Proof, edge_bits: u8) -> [u8; 32] {
     let bit_len = proof.nonces.len() * usize::from(edge_bits);
     let mut packed = vec![0_u8; bit_len.div_ceil(8)];
@@ -132,10 +118,11 @@ pub fn proof_hash(proof: &Proof, edge_bits: u8) -> [u8; 32] {
     Blake2b256::digest(packed).into()
 }
 
-pub fn proof_difficulty(proof: &Proof, edge_bits: u8, height: u64) -> u64 {
+/// Difficulty used by Grin Stratum's minimum share threshold.
+pub fn unscaled_proof_difficulty(proof: &Proof, edge_bits: u8) -> u64 {
     let hash = proof_hash(proof, edge_bits);
     let denominator = u64::from_be_bytes(hash[0..8].try_into().expect("fixed slice")).max(1);
-    let numerator = u128::from(graph_weight(height, edge_bits)) << 64;
+    let numerator = 1_u128 << 64;
     (numerator / u128::from(denominator)).min(u128::from(u64::MAX)) as u64
 }
 
@@ -192,7 +179,7 @@ mod tests {
     ];
 
     #[test]
-    fn verifies_both_known_c32_gate_proofs() {
+    fn known_gate_proofs_verify() {
         for (nonce, proof) in [(45, NONCE_45), (74, NONCE_74)] {
             verify_cycle(
                 derive_keys(&[0], nonce),
@@ -220,6 +207,28 @@ mod tests {
                 },
             )
             .is_err()
+        );
+    }
+
+    #[test]
+    fn known_c32_share_difficulty() {
+        assert_eq!(
+            unscaled_proof_difficulty(
+                &Proof {
+                    nonces: NONCE_45.to_vec(),
+                },
+                32,
+            ),
+            5
+        );
+        assert_eq!(
+            unscaled_proof_difficulty(
+                &Proof {
+                    nonces: NONCE_74.to_vec(),
+                },
+                32,
+            ),
+            3
         );
     }
 }

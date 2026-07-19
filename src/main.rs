@@ -41,14 +41,22 @@ fn make_solver(args: &SolverArgs) -> Result<Box<dyn Solver>> {
             match GpuWgpuSolver::new_with_config(gpu_config()) {
                 Ok(solver) => Ok(Box::new(solver)),
                 Err(error) => {
-                    eprintln!("GPU unavailable ({error}); falling back to CPU");
-                    Ok(Box::new(CpuLeanSolver::default()))
+                    let cpu = CpuLeanSolver::default();
+                    if args.edge_bits <= cpu.capabilities().max_edge_bits {
+                        eprintln!("GPU unavailable ({error}); falling back to CPU");
+                        Ok(Box::new(cpu))
+                    } else {
+                        Err(anyhow::anyhow!(
+                            "GPU unavailable ({error}); CPU supports at most C{}",
+                            cpu.capabilities().max_edge_bits
+                        ))
+                    }
                 }
             }
         }
         Backend::Metal => Ok(Box::new(GpuMetalSolver::new(gpu_config())?)),
         Backend::Cpu => Ok(Box::new(CpuLeanSolver::default())),
-        Backend::Gpu => Ok(Box::new(GpuWgpuSolver::new_with_config(gpu_config())?)),
+        Backend::Wgpu => Ok(Box::new(GpuWgpuSolver::new_with_config(gpu_config())?)),
     }
 }
 
@@ -57,20 +65,9 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Command::Mine(args) => {
-            if [
-                "GRIN_MINER_DIAGNOSTIC_NODE_MASK_BITS",
-                "GRIN_MINER_DIAGNOSTIC_SIPHASH_ONLY",
-                "GRIN_MINER_DIAGNOSTIC_PER_ROUND",
-                "GRIN_MINER_DIAGNOSTIC_EARLY_PHASES",
-                "GRIN_MINER_DIAGNOSTIC_BUCKET_ROUND0",
-                "GRIN_MINER_DIAGNOSTIC_BUCKETS",
-                "GRIN_MINER_DIAGNOSTIC_SURVIVOR_COUNTS",
-                "GRIN_MINER_DIAGNOSTIC_FINE_CSR",
-                "GRIN_MINER_DIAGNOSTIC_FINE_END_ROUND",
-                "GRIN_MINER_DIAGNOSTIC_SLEAN_PHASES",
-            ]
-            .iter()
-            .any(|name| std::env::var_os(name).is_some())
+            if grin_cuckatoo_miner::solver::gpu_wgpu::diagnostic_env_vars()
+                .iter()
+                .any(|name| std::env::var_os(name).is_some())
             {
                 bail!("GPU diagnostic environment variables are forbidden in mine mode");
             }
@@ -111,7 +108,7 @@ async fn main() -> Result<()> {
                 let request = SolveRequest {
                     pre_pow: pre_pow.clone(),
                     nonce,
-                    job: None,
+                    live_work: false,
                     edge_bits: args.solver.edge_bits,
                     cycle_length: args.solver.cycle_length,
                     rounds: args.solver.rounds,

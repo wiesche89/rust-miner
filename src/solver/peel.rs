@@ -5,10 +5,7 @@ use crate::{
     solver::{GraphParams, SolveError, d2::radix_order},
 };
 
-/// Computes the exact bipartite 2-core of a survivor set. An edge is removed
-/// whenever it has no live mate (`endpoint ^ 1`) on either side. Removing an
-/// edge can make another endpoint empty, so a queue continues to a fixpoint.
-/// Every cycle is preserved.
+/// Removes edges without a live mate until the bipartite core is stable.
 pub(crate) fn peel_two_core(
     request: GraphParams,
     survivors: &[u64],
@@ -37,8 +34,7 @@ pub(crate) fn peel_two_core(
         })
         .collect();
 
-    // Radix order turns every endpoint group into one contiguous CSR run.
-    // This avoids a HashMap lookup per edge and a heap allocation per group.
+    // Radix order makes each endpoint group contiguous.
     for side in [0_usize, 1] {
         let keys: Vec<u32> = endpoint_pairs.iter().map(|pair| pair[side]).collect();
         let order = radix_order(&keys);
@@ -124,7 +120,7 @@ mod tests {
     use crate::{keys::derive_keys, solver::cpu_lean::trim_survivors};
 
     #[test]
-    fn peel_is_idempotent_and_only_removes_edges() {
+    fn peel_reaches_a_fixed_core() {
         let request = GraphParams {
             keys: derive_keys(&[0], 7),
             edge_bits: 12,

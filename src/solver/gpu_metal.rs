@@ -1,7 +1,6 @@
 //! macOS GPU backend boundary.
 //!
-//! The public solver type is isolated from the portable wgpu backend so both
-//! implementations share the CLI and coordinator without sharing GPU state.
+//! Metal and wgpu share the CLI, but keep separate GPU state.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -188,8 +187,7 @@ mod native {
             if (gid >= params.edge_count) return;
             const uint edge = params.edge_base + gid;
             const uint node = cuckatoo_endpoint(edge, params);
-            // edge_base is aligned to the part size; edge_count and the
-            // endpoint prefix determine the same 1.05x capacity as the host.
+            // Keep this capacity calculation in sync with the host.
             const uint bucket_shift = params.edge_bits > 18u ? 18u : params.edge_bits;
             const uint bucket = node >> bucket_shift;
             const uint capacity = params.capacity;
@@ -214,27 +212,23 @@ mod native {
             const uint first_word = gid;
             if (first_word >= word_count) return;
             const uint bucket_shift = params.edge_bits > 18u ? 18u : params.edge_bits;
-            for (uint word_offset = 0u; word_offset < 1u; ++word_offset) {
-                const uint local_word = first_word + word_offset;
-                if (local_word >= word_count) break;
-                const uint first_edge = params.edge_base + local_word * 32u;
-                uint alive = edges[first_edge >> 5u];
-                while (alive != 0u) {
-                    const uint bit = ctz(alive);
-                    const uint edge = first_edge + bit;
-                    if (edge - params.edge_base < params.edge_count) {
-                        const uint node = cuckatoo_endpoint(edge, params);
-                        const uint bucket = node >> bucket_shift;
-                        const uint slot = atomic_fetch_add_explicit(
-                            &counts[bucket], 1u, memory_order_relaxed);
-                        if (slot < params.capacity) {
-                            arena[bucket * params.capacity + slot] = edge;
-                        } else {
-                            atomic_fetch_add_explicit(overflow, 1u, memory_order_relaxed);
-                        }
+            const uint first_edge = params.edge_base + first_word * 32u;
+            uint alive = edges[first_edge >> 5u];
+            while (alive != 0u) {
+                const uint bit = ctz(alive);
+                const uint edge = first_edge + bit;
+                if (edge - params.edge_base < params.edge_count) {
+                    const uint node = cuckatoo_endpoint(edge, params);
+                    const uint bucket = node >> bucket_shift;
+                    const uint slot = atomic_fetch_add_explicit(
+                        &counts[bucket], 1u, memory_order_relaxed);
+                    if (slot < params.capacity) {
+                        arena[bucket * params.capacity + slot] = edge;
+                    } else {
+                        atomic_fetch_add_explicit(overflow, 1u, memory_order_relaxed);
                     }
-                    alive &= alive - 1u;
                 }
+                alive &= alive - 1u;
             }
         }
 
@@ -307,9 +301,7 @@ mod native {
             }
         }
 
-        // Flamel steps four/six: collect dead edges by contiguous edge range.
-        // The following apply kernel can therefore update the global bitmap
-        // with sequential stores instead of one random atomic per dead edge.
+        // Group dead edges so the next kernel can write sequentially.
         kernel void grin_miner_bucket_collect_dead(
             device const uint *arena [[buffer(0)]],
             device const uint *counts [[buffer(1)]],
@@ -348,9 +340,7 @@ mod native {
             }
         }
 
-        // Flamel step five: one workgroup owns one 2^18-edge range. Deaths
-        // are applied in threadgroup memory and the 32 KiB result is copied
-        // back with coalesced, non-atomic writes.
+        // One workgroup updates each 2^18-edge range locally.
         kernel void grin_miner_bucket_apply_dead(
             device const uint *dead_arena [[buffer(0)]],
             device const uint *dead_counts [[buffer(1)]],
@@ -484,8 +474,7 @@ mod native {
         started: Instant,
     }
 
-    /// Long-lived native objects. Keeping the device and queue alive also
-    /// gives the future C32 path a stable owner for sharded arena buffers.
+    /// Native objects kept for the solver's lifetime.
     pub(super) struct NativeMetalContext {
         device: Retained<ProtocolObject<dyn MTLDevice>>,
         queue: Retained<ProtocolObject<dyn MTLCommandQueue>>,
@@ -665,9 +654,7 @@ mod native {
                 .newBufferWithLength_options(byte_len, MTLResourceOptions::StorageModeShared)
                 .ok_or_else(|| SolveError::Gpu("native probe buffer allocation failed".into()))?;
 
-            // Shared storage is CPU coherent on Apple silicon. Initialize it
-            // before encoding, retain the buffer through completion, then
-            // validate every GPU-written word.
+            // Shared storage is CPU coherent on Apple silicon.
             let words = unsafe {
                 std::slice::from_raw_parts_mut(buffer.contents().as_ptr().cast::<u32>(), COUNT)
             };
@@ -893,7 +880,7 @@ mod native {
             }
             let overflow_count = unsafe { *overflow.contents().as_ptr().cast::<u32>() };
             if overflow_count != 0 {
-                return Err(SolveError::Gpu(format!(
+                return Err(SolveError::SearchLimit(format!(
                     "native seed part {part} overflowed by {overflow_count} edges"
                 )));
             }
@@ -981,7 +968,7 @@ mod native {
             }
             let overflow_count = unsafe { *overflow.contents().as_ptr().cast::<u32>() };
             if overflow_count != 0 {
-                return Err(SolveError::Gpu(format!(
+                return Err(SolveError::SearchLimit(format!(
                     "native bucket oracle overflowed by {overflow_count} edges"
                 )));
             }
@@ -1351,9 +1338,7 @@ mod native {
                     .shared_buffer(buckets * size_of::<u32>(), "low-memory source counts")?,
                 params,
             };
-            // Same 32 KiB edge-range buckets and 0.38 capacity used by the
-            // reference slean StepFour/StepFive path. Only one edge part is
-            // resident at a time, so C32/parts=4 needs about 1.52 GiB here.
+            // One C32 edge part is resident at a time.
             let dead_bucket_count = (part_edges >> 18).max(1);
             let dead_capacity = (((1usize << 18) * 38 / 100) / parts as usize) * parts as usize;
             scratch.params.destination_capacity = dead_capacity as u32;
@@ -1367,13 +1352,7 @@ mod native {
             )?;
             let overflow = self.shared_buffer(size_of::<u32>(), "round overflow")?;
             let started = Instant::now();
-            // Dense bitmap rounds are cheap enough while the population falls
-            // rapidly. Afterwards a compact global ping-pong arena avoids
-            // hashing the complete 2^32 edge range twice per round.
-            // Flamel switches representation after the first three dense
-            // rounds. At that point two globally bucketed survivor arenas
-            // fit comfortably on the 16 GiB target and every later round is
-            // proportional to the live population instead of 2^edge_bits.
+            // Start dense, then switch to compact survivor arenas.
             let dense_rounds = rounds.min(3);
             for round in 0..dense_rounds {
                 if cancel.load(Ordering::Relaxed) {
@@ -1571,7 +1550,7 @@ mod native {
                 }
                 let overflow_count = unsafe { *overflow.contents().as_ptr().cast::<u32>() };
                 if overflow_count != 0 {
-                    return Err(SolveError::Gpu(format!(
+                    return Err(SolveError::SearchLimit(format!(
                         "native round {} bucket overflowed by {overflow_count} edges",
                         round + 1
                     )));
@@ -1647,8 +1626,7 @@ mod native {
                 .iter()
                 .map(|word| word.count_ones() as usize)
                 .sum::<usize>();
-            // Uniform hashing makes +15% and 1024 entries per bucket a very
-            // conservative exact capacity while keeping both arenas compact.
+            // A 15% margin keeps both arenas compact without losing edges.
             let capacity = (alive.div_ceil(buckets) * 115 / 100 + 1024 + 3) & !3;
             eprintln!(
                 "C{edge_bits} native transition round={start_round} alive={alive} capacity={capacity}"
@@ -1720,7 +1698,7 @@ mod native {
             }
             let overflow_count = unsafe { *overflow.contents().as_ptr().cast::<u32>() };
             if overflow_count != 0 {
-                return Err(SolveError::Gpu(format!(
+                return Err(SolveError::SearchLimit(format!(
                     "hybrid seed overflowed by {overflow_count} edges"
                 )));
             }
@@ -1740,28 +1718,105 @@ mod native {
                     .write_bytes(0, word_count * size_of::<u32>());
                 overflow.contents().write_bytes(0, size_of::<u32>());
             }
-            let command_buffer = self
-                .queue
-                .commandBuffer()
-                .ok_or_else(|| SolveError::Gpu("hybrid loop command buffer failed".into()))?;
-            let encoder = command_buffer
-                .computeCommandEncoder()
-                .ok_or_else(|| SolveError::Gpu("hybrid loop encoder failed".into()))?;
-            for round in start_round..rounds {
+            const ROUNDS_PER_COMMAND_BUFFER: u32 = 16;
+            let mut batch_start = start_round;
+            while batch_start < rounds {
                 if cancel.load(Ordering::Relaxed) {
                     return Ok(None);
                 }
-                let even = (round - start_round).is_multiple_of(2);
-                let (from, to) = if even {
-                    (&source, &destination)
-                } else {
-                    (&destination, &source)
-                };
+                let batch_end = (batch_start + ROUNDS_PER_COMMAND_BUFFER).min(rounds);
+                let command_buffer = self
+                    .queue
+                    .commandBuffer()
+                    .ok_or_else(|| SolveError::Gpu("hybrid loop command buffer failed".into()))?;
+                let encoder = command_buffer
+                    .computeCommandEncoder()
+                    .ok_or_else(|| SolveError::Gpu("hybrid loop encoder failed".into()))?;
+                for round in batch_start..batch_end {
+                    let even = (round - start_round).is_multiple_of(2);
+                    let (from, to) = if even {
+                        (&source, &destination)
+                    } else {
+                        (&destination, &source)
+                    };
 
-                if round + 1 == rounds {
-                    encoder.setComputePipelineState(&self.clear_nodes_pipeline);
+                    if round + 1 == rounds {
+                        encoder.setComputePipelineState(&self.clear_nodes_pipeline);
+                        unsafe {
+                            encoder.setBuffer_offset_atIndex(Some(&nodes), 0, 0);
+                            encoder.setBytes_length_atIndex(
+                                NonNull::from(&from.params).cast::<c_void>(),
+                                size_of::<EndpointParams>(),
+                                1,
+                            );
+                        }
+                        encoder.dispatchThreadgroups_threadsPerThreadgroup(
+                            MTLSize {
+                                width: word_count.div_ceil(THREADS),
+                                height: 1,
+                                depth: 1,
+                            },
+                            MTLSize {
+                                width: THREADS,
+                                height: 1,
+                                depth: 1,
+                            },
+                        );
+
+                        encoder.setComputePipelineState(&self.bucket_mark_pipeline);
+                        unsafe {
+                            encoder.setBuffer_offset_atIndex(Some(&from.arena), 0, 0);
+                            encoder.setBuffer_offset_atIndex(Some(&from.counts), 0, 1);
+                            encoder.setBuffer_offset_atIndex(Some(&nodes), 0, 2);
+                            encoder.setBytes_length_atIndex(
+                                NonNull::from(&from.params).cast::<c_void>(),
+                                size_of::<EndpointParams>(),
+                                3,
+                            );
+                        }
+                        encoder.dispatchThreadgroups_threadsPerThreadgroup(
+                            MTLSize {
+                                width: buckets,
+                                height: 1,
+                                depth: 1,
+                            },
+                            MTLSize {
+                                width: THREADS,
+                                height: 1,
+                                depth: 1,
+                            },
+                        );
+
+                        unsafe {
+                            encoder.setComputePipelineState(&self.bucket_trim_pipeline);
+                            encoder.setBuffer_offset_atIndex(Some(&from.arena), 0, 0);
+                            encoder.setBuffer_offset_atIndex(Some(&from.counts), 0, 1);
+                            encoder.setBuffer_offset_atIndex(Some(&nodes), 0, 2);
+                            encoder.setBuffer_offset_atIndex(Some(&survivors), 0, 3);
+                            encoder.setBytes_length_atIndex(
+                                NonNull::from(&from.params).cast::<c_void>(),
+                                size_of::<EndpointParams>(),
+                                4,
+                            );
+                        }
+                        encoder.dispatchThreadgroups_threadsPerThreadgroup(
+                            MTLSize {
+                                width: buckets,
+                                height: 1,
+                                depth: 1,
+                            },
+                            MTLSize {
+                                width: THREADS,
+                                height: 1,
+                                depth: 1,
+                            },
+                        );
+                        break;
+                    }
+
+                    encoder.setComputePipelineState(&self.clear_counts_pipeline);
                     unsafe {
-                        encoder.setBuffer_offset_atIndex(Some(&nodes), 0, 0);
+                        encoder.setBuffer_offset_atIndex(Some(&to.counts), 0, 0);
                         encoder.setBytes_length_atIndex(
                             NonNull::from(&from.params).cast::<c_void>(),
                             size_of::<EndpointParams>(),
@@ -1770,7 +1825,7 @@ mod native {
                     }
                     encoder.dispatchThreadgroups_threadsPerThreadgroup(
                         MTLSize {
-                            width: word_count.div_ceil(THREADS),
+                            width: buckets.div_ceil(THREADS),
                             height: 1,
                             depth: 1,
                         },
@@ -1781,15 +1836,17 @@ mod native {
                         },
                     );
 
-                    encoder.setComputePipelineState(&self.bucket_mark_pipeline);
+                    encoder.setComputePipelineState(&self.bucket_ping_pong_fused_pipeline);
                     unsafe {
                         encoder.setBuffer_offset_atIndex(Some(&from.arena), 0, 0);
                         encoder.setBuffer_offset_atIndex(Some(&from.counts), 0, 1);
-                        encoder.setBuffer_offset_atIndex(Some(&nodes), 0, 2);
+                        encoder.setBuffer_offset_atIndex(Some(&to.arena), 0, 2);
+                        encoder.setBuffer_offset_atIndex(Some(&to.counts), 0, 3);
+                        encoder.setBuffer_offset_atIndex(Some(&overflow), 0, 4);
                         encoder.setBytes_length_atIndex(
                             NonNull::from(&from.params).cast::<c_void>(),
                             size_of::<EndpointParams>(),
-                            3,
+                            5,
                         );
                     }
                     encoder.dispatchThreadgroups_threadsPerThreadgroup(
@@ -1804,91 +1861,18 @@ mod native {
                             depth: 1,
                         },
                     );
-
-                    unsafe {
-                        encoder.setComputePipelineState(&self.bucket_trim_pipeline);
-                        encoder.setBuffer_offset_atIndex(Some(&from.arena), 0, 0);
-                        encoder.setBuffer_offset_atIndex(Some(&from.counts), 0, 1);
-                        encoder.setBuffer_offset_atIndex(Some(&nodes), 0, 2);
-                        encoder.setBuffer_offset_atIndex(Some(&survivors), 0, 3);
-                        encoder.setBytes_length_atIndex(
-                            NonNull::from(&from.params).cast::<c_void>(),
-                            size_of::<EndpointParams>(),
-                            4,
-                        );
-                    }
-                    encoder.dispatchThreadgroups_threadsPerThreadgroup(
-                        MTLSize {
-                            width: buckets,
-                            height: 1,
-                            depth: 1,
-                        },
-                        MTLSize {
-                            width: THREADS,
-                            height: 1,
-                            depth: 1,
-                        },
-                    );
-                    break;
                 }
-
-                encoder.setComputePipelineState(&self.clear_counts_pipeline);
-                unsafe {
-                    encoder.setBuffer_offset_atIndex(Some(&to.counts), 0, 0);
-                    encoder.setBytes_length_atIndex(
-                        NonNull::from(&from.params).cast::<c_void>(),
-                        size_of::<EndpointParams>(),
-                        1,
-                    );
+                encoder.endEncoding();
+                command_buffer.commit();
+                command_buffer.waitUntilCompleted();
+                if let Some(error) = command_buffer.error() {
+                    return Err(SolveError::Gpu(format!("hybrid loop failed: {error}")));
                 }
-                encoder.dispatchThreadgroups_threadsPerThreadgroup(
-                    MTLSize {
-                        width: buckets.div_ceil(THREADS),
-                        height: 1,
-                        depth: 1,
-                    },
-                    MTLSize {
-                        width: THREADS,
-                        height: 1,
-                        depth: 1,
-                    },
-                );
-
-                encoder.setComputePipelineState(&self.bucket_ping_pong_fused_pipeline);
-                unsafe {
-                    encoder.setBuffer_offset_atIndex(Some(&from.arena), 0, 0);
-                    encoder.setBuffer_offset_atIndex(Some(&from.counts), 0, 1);
-                    encoder.setBuffer_offset_atIndex(Some(&to.arena), 0, 2);
-                    encoder.setBuffer_offset_atIndex(Some(&to.counts), 0, 3);
-                    encoder.setBuffer_offset_atIndex(Some(&overflow), 0, 4);
-                    encoder.setBytes_length_atIndex(
-                        NonNull::from(&from.params).cast::<c_void>(),
-                        size_of::<EndpointParams>(),
-                        5,
-                    );
-                }
-                encoder.dispatchThreadgroups_threadsPerThreadgroup(
-                    MTLSize {
-                        width: buckets,
-                        height: 1,
-                        depth: 1,
-                    },
-                    MTLSize {
-                        width: THREADS,
-                        height: 1,
-                        depth: 1,
-                    },
-                );
-            }
-            encoder.endEncoding();
-            command_buffer.commit();
-            command_buffer.waitUntilCompleted();
-            if let Some(error) = command_buffer.error() {
-                return Err(SolveError::Gpu(format!("hybrid loop failed: {error}")));
+                batch_start = batch_end;
             }
             let overflow_count = unsafe { *overflow.contents().as_ptr().cast::<u32>() };
             if overflow_count != 0 {
-                return Err(SolveError::Gpu(format!(
+                return Err(SolveError::SearchLimit(format!(
                     "hybrid loop overflowed by {overflow_count} edges"
                 )));
             }
@@ -1945,7 +1929,13 @@ mod native {
 
     #[cfg(test)]
     mod tests {
-        use std::sync::atomic::AtomicBool;
+        use std::{
+            sync::{
+                Arc,
+                atomic::{AtomicBool, Ordering},
+            },
+            time::Duration,
+        };
 
         use super::NativeMetalContext;
         use crate::{
@@ -1954,13 +1944,13 @@ mod native {
         };
 
         #[test]
-        fn native_multi_round_ping_pong_matches_cpu() {
+        fn multi_round_matches_cpu() {
             let context = NativeMetalContext::new().unwrap();
             let params = GraphParams {
                 keys: derive_keys(&[0], 9),
                 edge_bits: 18,
                 cycle_length: 42,
-                rounds: 12,
+                rounds: 24,
             };
             let cancel = AtomicBool::new(false);
             let native = context
@@ -1970,12 +1960,28 @@ mod native {
             let cpu = trim_survivors(params, params.edge_bits).unwrap();
             assert_eq!(native, cpu);
         }
+
+        #[test]
+        #[ignore = "requires native Metal and a C32 allocation"]
+        fn c32_honors_cancel() {
+            let context = NativeMetalContext::new().unwrap();
+            let cancel = Arc::new(AtomicBool::new(false));
+            let trigger = Arc::clone(&cancel);
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(200));
+                trigger.store(true, Ordering::Relaxed);
+            });
+            let result = context
+                .trim_survivors(derive_keys(&[0], 0), 32, 128, 4, &cancel)
+                .unwrap();
+            assert!(result.is_none());
+        }
     }
 }
 
 pub struct GpuMetalSolver {
     #[cfg(target_os = "macos")]
-    _native: native::NativeMetalContext,
+    native: native::NativeMetalContext,
     config: GpuWgpuConfig,
 }
 
@@ -1984,11 +1990,11 @@ impl GpuMetalSolver {
     pub fn new(config: GpuWgpuConfig) -> Result<Self, SolveError> {
         if config.trimming == crate::solver::TrimmingMode::Lean {
             return Err(SolveError::Unsupported(
-                "native Metal supports slean trimming; use --backend gpu for lean".into(),
+                "native Metal supports slean trimming; use --backend wgpu for lean".into(),
             ));
         }
         Ok(Self {
-            _native: native::NativeMetalContext::new()?,
+            native: native::NativeMetalContext::new()?,
             config,
         })
     }
@@ -1996,7 +2002,7 @@ impl GpuMetalSolver {
     #[cfg(not(target_os = "macos"))]
     pub fn new(_config: GpuWgpuConfig) -> Result<Self, SolveError> {
         Err(SolveError::Unsupported(
-            "the Metal backend is available only on macOS; use --backend auto or gpu".into(),
+            "the Metal backend is available only on macOS; use --backend auto or wgpu".into(),
         ))
     }
 
@@ -2018,6 +2024,11 @@ impl Solver for GpuMetalSolver {
         }
     }
 
+    fn recover(&mut self) -> Result<(), SolveError> {
+        *self = Self::new(self.config)?;
+        Ok(())
+    }
+
     fn solve(
         &mut self,
         request: SolveRequest,
@@ -2028,15 +2039,19 @@ impl Solver for GpuMetalSolver {
             validate_request(&request, self.capabilities())?;
             let graph = request.graph_params();
             let solve_started = std::time::Instant::now();
-            let Some(survivors) = self._native.trim_survivors(
+            let survivors = match self.native.trim_survivors(
                 graph.keys,
                 graph.edge_bits,
                 graph.rounds,
                 self.config.slean_parts,
                 cancel,
-            )?
-            else {
-                return Ok(SolveOutcome::Cancelled);
+            ) {
+                Ok(Some(survivors)) => survivors,
+                Ok(None) => return Ok(SolveOutcome::Cancelled),
+                Err(SolveError::SearchLimit(reason)) => {
+                    return Ok(SolveOutcome::Inconclusive(reason));
+                }
+                Err(error) => return Err(error),
             };
             let before_peel = survivors.len();
             let peel_started = std::time::Instant::now();

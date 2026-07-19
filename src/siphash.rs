@@ -70,7 +70,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn optimized_endpoint_is_masked_siphash() {
+    fn endpoint_matches_siphash() {
         let keys = SipKeys {
             k0: 1,
             k1: 2,

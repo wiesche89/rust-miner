@@ -17,16 +17,101 @@ use crate::{
     },
 };
 
+const NODE_MASK_BITS: &str = "GRIN_MINER_DIAGNOSTIC_NODE_MASK_BITS";
+const SIPHASH_ONLY: &str = "GRIN_MINER_DIAGNOSTIC_SIPHASH_ONLY";
+const PER_ROUND: &str = "GRIN_MINER_DIAGNOSTIC_PER_ROUND";
+const EARLY_PHASES: &str = "GRIN_MINER_DIAGNOSTIC_EARLY_PHASES";
+const BUCKET_ROUND0: &str = "GRIN_MINER_DIAGNOSTIC_BUCKET_ROUND0";
+const BUCKETS: &str = "GRIN_MINER_DIAGNOSTIC_BUCKETS";
+const SURVIVOR_COUNTS: &str = "GRIN_MINER_DIAGNOSTIC_SURVIVOR_COUNTS";
+const FINE_CSR: &str = "GRIN_MINER_DIAGNOSTIC_FINE_CSR";
+const FINE_END_ROUND: &str = "GRIN_MINER_DIAGNOSTIC_FINE_END_ROUND";
+const SLEAN_PHASES: &str = "GRIN_MINER_DIAGNOSTIC_SLEAN_PHASES";
+
+const DIAGNOSTIC_ENV_VARS: &[&str] = &[
+    NODE_MASK_BITS,
+    SIPHASH_ONLY,
+    PER_ROUND,
+    EARLY_PHASES,
+    BUCKET_ROUND0,
+    BUCKETS,
+    SURVIVOR_COUNTS,
+    FINE_CSR,
+    FINE_END_ROUND,
+    SLEAN_PHASES,
+];
+
+const DIAGNOSTIC_BUCKET_HEADER_WORDS: u64 = 256;
+const DIAGNOSTIC_BUCKET_OVERFLOW_WORD: u64 = 128;
+const DIAGNOSTIC_BUCKET_MARGIN: u64 = 1 << 16;
+
+#[derive(Clone, Copy)]
+struct Diagnostics {
+    per_round: bool,
+    #[cfg(feature = "diagnostics")]
+    siphash_only: bool,
+    bucket_round0: bool,
+    survivor_counts: bool,
+    early_phases: bool,
+    slean_phases: bool,
+    fine_csr: bool,
+    fine_end_round: u32,
+    bucket_count: u32,
+    mask_bits: Option<u8>,
+    rounds: u32,
+}
+
+#[cfg(not(feature = "diagnostics"))]
+impl Diagnostics {
+    fn result_only_from_env() -> bool {
+        false
+    }
+
+    fn from_env(
+        _edge_bits: u8,
+        rounds: u32,
+        fine_end_override: Option<u32>,
+    ) -> Result<Self, SolveError> {
+        Ok(Self {
+            per_round: false,
+            bucket_round0: false,
+            survivor_counts: false,
+            early_phases: false,
+            slean_phases: false,
+            fine_csr: false,
+            fine_end_round: fine_end_override.unwrap_or(64),
+            bucket_count: 16,
+            mask_bits: None,
+            rounds,
+        })
+    }
+
+    fn result_only(&self) -> bool {
+        false
+    }
+
+    fn has_exclusive(&self) -> bool {
+        false
+    }
+
+    fn node_mask(&self, edge_bits: u8) -> u32 {
+        if edge_bits == 32 {
+            u32::MAX
+        } else {
+            (1_u32 << edge_bits) - 1
+        }
+    }
+}
+
+#[cfg(feature = "diagnostics")]
 #[path = "gpu_diagnostics.rs"]
 mod gpu_diagnostics;
 #[path = "gpu_fine.rs"]
 mod gpu_fine;
 
-use self::gpu_diagnostics::{
-    BUCKET_HEADER_WORDS as DIAGNOSTIC_BUCKET_HEADER_WORDS,
-    BUCKET_MARGIN as DIAGNOSTIC_BUCKET_MARGIN,
-    BUCKET_OVERFLOW_WORD as DIAGNOSTIC_BUCKET_OVERFLOW_WORD, Diagnostics,
-};
+pub fn diagnostic_env_vars() -> &'static [&'static str] {
+    DIAGNOSTIC_ENV_VARS
+}
 
 const WORKGROUP_SIZE: u32 = 256;
 const DISPATCH_GROUPS: u32 = 4096;
@@ -96,7 +181,7 @@ fn endpoint_for_side(edge: u32, side: u32) -> u32 {
 "#;
 
 fn shader_source(native_int64: bool) -> Result<String, SolveError> {
-    let source = include_str!("lean.wgsl").to_owned();
+    let source = include_str!(concat!(env!("OUT_DIR"), "/lean.wgsl")).to_owned();
     if !native_int64 {
         return Ok(source);
     }
@@ -172,9 +257,9 @@ struct Params {
     edge_count_lo: u32,
     word_count: u32,
     node_mask: u32,
-    diagnostic_chunk_base: u32,
-    diagnostic_chunk_count: u32,
-    diagnostic_bucket: u32,
+    chunk_base: u32,
+    chunk_count: u32,
+    bucket_config: u32,
 }
 
 const _: () = {
@@ -189,6 +274,7 @@ struct GpuContext {
     module: wgpu::ShaderModule,
     limits: wgpu::Limits,
     adapter_name: String,
+    #[cfg(feature = "diagnostics")]
     native_int64: bool,
 }
 
@@ -280,12 +366,12 @@ impl GpuContext {
     }
 }
 
-/// Portable bitmap-based lean trimmer. It needs one edge bitmap and one node
-/// bitmap (about 1 GiB total for C32), then searches the compact survivors on CPU.
+/// Portable bitmap trimmer with CPU survivor search.
 pub struct GpuWgpuSolver {
     context: GpuContext,
     pipelines: TrimPipelines,
     config: GpuWgpuConfig,
+    startup_available_memory: Option<u64>,
     bucketed_rounds: AtomicU32,
     bucket_trim_rounds: AtomicU32,
     bucket_fallbacks: AtomicU32,
@@ -387,6 +473,7 @@ enum TrimOutcome {
     Diagnostic(&'static str),
 }
 
+#[cfg(feature = "diagnostics")]
 struct BucketRound0Resources<'a> {
     edges: &'a wgpu::Buffer,
     nodes: &'a wgpu::Buffer,
@@ -452,6 +539,7 @@ struct FineLoopResources<'a> {
     validate_output: bool,
 }
 
+#[cfg(feature = "diagnostics")]
 struct FineDiagnosticResources<'a> {
     nodes: &'a wgpu::Buffer,
     scratch: &'a wgpu::Buffer,
@@ -760,10 +848,10 @@ impl SleanBindings {
                     .map(|part| {
                         let base = part * sizing.part_edges;
                         let mut params = *base_params;
-                        params.diagnostic_chunk_base = base as u32;
-                        params.diagnostic_chunk_count =
-                            sizing.part_edges.min(edge_count - base) as u32;
-                        params.diagnostic_bucket = (sizing.bucket_count as u32) << 16
+                        params.chunk_base = base as u32;
+                        params.chunk_count = sizing.part_edges.min(edge_count - base) as u32;
+                        // The low bit forces the overflow path in GPU tests.
+                        params.bucket_config = (sizing.bucket_count as u32) << 16
                             | u32::from(solver.force_slean_overflow.load(Ordering::Relaxed));
                         uniform_buffer(context, "slean part params", &params)
                     })
@@ -858,9 +946,9 @@ impl BucketBindings {
                         let base = chunk * chunk_edges;
                         let count = chunk_edges.min(edge_count - base);
                         let mut params = *base_params;
-                        params.diagnostic_chunk_base = base as u32;
-                        params.diagnostic_chunk_count = count as u32;
-                        params.diagnostic_bucket = BUCKETED_MARK_BUCKETS << 16;
+                        params.chunk_base = base as u32;
+                        params.chunk_count = count as u32;
+                        params.bucket_config = BUCKETED_MARK_BUCKETS << 16;
                         make_uniform("bucketed alive scatter params", &params)
                     })
                     .map(|uniform| {
@@ -881,8 +969,8 @@ impl BucketBindings {
                 (0..BUCKETED_MARK_BUCKETS)
                     .map(|bucket| {
                         let mut params = *base_params;
-                        params.diagnostic_chunk_count = chunk_edges as u32;
-                        params.diagnostic_bucket = (BUCKETED_MARK_BUCKETS << 16) | bucket;
+                        params.chunk_count = chunk_edges as u32;
+                        params.bucket_config = (BUCKETED_MARK_BUCKETS << 16) | bucket;
                         make_uniform("bucketed mark params", &params)
                     })
                     .map(|uniform| {
@@ -1009,9 +1097,12 @@ struct TrimPipelines {
     fine_arena_layout: wgpu::BindGroupLayout,
     init: wgpu::ComputePipeline,
     clear: wgpu::ComputePipeline,
+    #[cfg(feature = "diagnostics")]
     siphash_only: wgpu::ComputePipeline,
     count_alive: wgpu::ComputePipeline,
+    #[cfg(feature = "diagnostics")]
     dense_mark: wgpu::ComputePipeline,
+    #[cfg(feature = "diagnostics")]
     bucket_scatter: wgpu::ComputePipeline,
     bucket_scatter_dense_staged: wgpu::ComputePipeline,
     bucket_scatter_alive: wgpu::ComputePipeline,
@@ -1035,7 +1126,9 @@ struct TrimPipelines {
     fine_trim_count: wgpu::ComputePipeline,
     fine_trim_scatter: wgpu::ComputePipeline,
     fine_trim_fixed: wgpu::ComputePipeline,
+    #[cfg(feature = "diagnostics")]
     fine_emit_bitmap: wgpu::ComputePipeline,
+    #[cfg(feature = "diagnostics")]
     compare_bitmaps: wgpu::ComputePipeline,
 }
 
@@ -1064,9 +1157,12 @@ impl TrimPipelines {
         Self {
             init: make("init_edges", &lean),
             clear: make("clear_nodes", &lean),
+            #[cfg(feature = "diagnostics")]
             siphash_only: make("siphash_only", &lean),
             count_alive: make("count_alive_edges", &lean),
+            #[cfg(feature = "diagnostics")]
             dense_mark: make("dense_mark_nodes", &lean),
+            #[cfg(feature = "diagnostics")]
             bucket_scatter: make("bucket_scatter_nodes", &lean),
             bucket_scatter_dense_staged: make("bucket_scatter_dense_nodes_staged", &lean),
             bucket_scatter_alive: make("bucket_scatter_alive_nodes", &lean),
@@ -1090,7 +1186,9 @@ impl TrimPipelines {
             fine_trim_count: make("fine_trim_count", &fine_arena),
             fine_trim_scatter: make("fine_trim_scatter", &fine_ping_pong),
             fine_trim_fixed: make("fine_trim_fixed", &fine_ping_pong),
+            #[cfg(feature = "diagnostics")]
             fine_emit_bitmap: make("fine_emit_bitmap", &fine_arena),
+            #[cfg(feature = "diagnostics")]
             compare_bitmaps: make("compare_edge_node_bitmaps", &lean),
             lean_layout,
             slean_layout,
@@ -1157,6 +1255,7 @@ fn compute_pipeline(
 }
 
 impl PreparedTrim {
+    #[cfg(feature = "diagnostics")]
     fn run_diagnostic(
         &self,
         solver: &GpuWgpuSolver,
@@ -1191,6 +1290,15 @@ impl PreparedTrim {
                 )
                 .map(Some);
         }
+        Ok(None)
+    }
+
+    #[cfg(not(feature = "diagnostics"))]
+    fn run_diagnostic(
+        &self,
+        _solver: &GpuWgpuSolver,
+        _request: GraphParams,
+    ) -> Result<Option<TrimOutcome>, SolveError> {
         Ok(None)
     }
 
@@ -1510,6 +1618,7 @@ impl GpuWgpuSolver {
             module,
             limits,
             adapter_name,
+            #[cfg(feature = "diagnostics")]
             native_int64,
         };
         let pipelines = TrimPipelines::new(&context);
@@ -1517,6 +1626,7 @@ impl GpuWgpuSolver {
             context,
             pipelines,
             config,
+            startup_available_memory: available_memory_bytes(),
             bucketed_rounds: AtomicU32::new(0),
             bucket_trim_rounds: AtomicU32::new(0),
             bucket_fallbacks: AtomicU32::new(0),
@@ -1532,9 +1642,10 @@ impl GpuWgpuSolver {
 
     fn selected_slean_parts(&self, enabled: bool) -> u64 {
         let mut parts = u64::from(self.config.slean_parts);
+        let available = enabled.then_some(self.startup_available_memory).flatten();
         if enabled
             && self.config.trimming == TrimmingMode::Auto
-            && let Some(available) = available_memory_bytes()
+            && let Some(available) = available
         {
             parts = if available >= SLEAN_PARTS_TWO_AVAILABLE_MEMORY {
                 2
@@ -1549,8 +1660,7 @@ impl GpuWgpuSolver {
         if enabled
             && !cfg!(test)
             && parts == 2
-            && available_memory_bytes()
-                .is_none_or(|available| available < SLEAN_PARTS_TWO_AVAILABLE_MEMORY)
+            && available.is_none_or(|available| available < SLEAN_PARTS_TWO_AVAILABLE_MEMORY)
         {
             eprintln!("slean parts increased 2->4: parts=2 needs at least 18 GiB available memory");
             parts = 4;
@@ -1592,6 +1702,7 @@ impl GpuWgpuSolver {
             }
             let part_edges = edge_count.div_ceil(parts);
             let base = part_edges.div_ceil(bucket_count);
+            // Keep this in sync with slean_capacity() in lean.wgsl.
             let capacity = if self.force_slean_overflow.load(Ordering::Relaxed) {
                 1
             } else {
@@ -2371,25 +2482,30 @@ impl GpuWgpuSolver {
             );
             return Ok(Some(survivors));
         }
-        self.verify_fine_against_direct(
-            request,
-            &arena,
-            FineDiagnosticResources {
-                nodes: &resources.buffers.nodes,
-                scratch: seed.scratch,
-                bind_groups: seed.bind_groups,
-                completed_round: resources.completed_round,
-                end_round: resources.end_round,
-                input_survivors: seed.survivors,
-                seed_histogram,
-                seed_scatter,
-                fine_count,
-                fine_scatter,
-                fine_wall,
-                groups_for_words: resources.groups_for_words,
-            },
-        )?;
-        Ok(None)
+        #[cfg(feature = "diagnostics")]
+        {
+            self.verify_fine_against_direct(
+                request,
+                &arena,
+                FineDiagnosticResources {
+                    nodes: &resources.buffers.nodes,
+                    scratch: seed.scratch,
+                    bind_groups: seed.bind_groups,
+                    completed_round: resources.completed_round,
+                    end_round: resources.end_round,
+                    input_survivors: seed.survivors,
+                    seed_histogram,
+                    seed_scatter,
+                    fine_count,
+                    fine_scatter,
+                    fine_wall,
+                    groups_for_words: resources.groups_for_words,
+                },
+            )?;
+            Ok(None)
+        }
+        #[cfg(not(feature = "diagnostics"))]
+        unreachable!("non-production fine path requires the diagnostics feature")
     }
     fn encode_lean_rounds(
         &self,
@@ -2515,9 +2631,9 @@ impl GpuWgpuSolver {
             edge_count_lo: graph.edge_count as u32,
             word_count: graph.word_count as u32,
             node_mask: diagnostics.node_mask(request.edge_bits),
-            diagnostic_chunk_base: 0,
-            diagnostic_chunk_count: 0,
-            diagnostic_bucket: 0,
+            chunk_base: 0,
+            chunk_count: 0,
+            bucket_config: 0,
         };
         let params = [params_for_side(0), params_for_side(1)];
         let buffers = TrimBuffers::new(
@@ -2640,13 +2756,18 @@ impl Solver for GpuWgpuSolver {
         }
     }
 
+    fn recover(&mut self) -> Result<(), SolveError> {
+        *self = Self::new_with_config(self.config)?;
+        Ok(())
+    }
+
     fn solve(
         &mut self,
         request: SolveRequest,
         cancel: &AtomicBool,
     ) -> Result<SolveOutcome, SolveError> {
         validate_request(&request, self.capabilities())?;
-        let live_work = request.job.is_some();
+        let live_work = request.live_work;
         let result_only_diagnostic = Diagnostics::result_only_from_env();
         let params = request.graph_params();
         let early_round = params.rounds.min(EARLY_VERDICT_ROUND);
@@ -2659,9 +2780,7 @@ impl Solver for GpuWgpuSolver {
                      falling back to full round-{} trim",
                     params.rounds
                 );
-                // Resource-limit fallback is deliberately rare. Rebuilding the
-                // bitmap keeps this implementation simple and correctness-first;
-                // a future persistent trim session can resume the same bitmap.
+                // Rebuild the bitmap after an inconclusive early trim.
                 self.verdict_at_round(params, params.rounds, live_work, cancel)
             }
             outcome => Ok(outcome),
@@ -2696,22 +2815,22 @@ mod tests {
     }
 
     #[test]
-    fn wgsl_parses_without_a_gpu_adapter() {
-        naga::front::wgsl::parse_str(include_str!("lean.wgsl")).expect("valid lean WGSL module");
+    fn wgsl_parses_without_adapter() {
+        naga::front::wgsl::parse_str(include_str!(concat!(env!("OUT_DIR"), "/lean.wgsl")))
+            .expect("valid lean WGSL module");
         let native = shader_source(true).expect("native-int64 WGSL source");
         naga::front::wgsl::parse_str(&native).expect("valid native-int64 WGSL module");
     }
 
     #[test]
-    fn reports_gpu_limits_if_adapter_exists() {
+    fn reports_limits_if_available() {
         let Some(solver) = gpu_solver() else {
             return;
         };
         let limits = &solver.context.limits;
         eprintln!(
-            "gpu={} native_int64={} max_buffer={}MiB max_storage_binding={}MiB storage_buffers_per_stage={} bind_groups={} workgroup_storage={}KiB",
+            "gpu={} max_buffer={}MiB max_storage_binding={}MiB storage_buffers_per_stage={} bind_groups={} workgroup_storage={}KiB",
             solver.context.adapter_name,
-            solver.context.native_int64,
             limits.max_buffer_size / (1024 * 1024),
             limits.max_storage_buffer_binding_size / (1024 * 1024),
             limits.max_storage_buffers_per_shader_stage,
@@ -2721,14 +2840,14 @@ mod tests {
     }
 
     #[test]
-    fn gpu_small_graph_is_safe_if_adapter_exists() {
+    fn small_graph_runs_if_available() {
         let Some(mut solver) = gpu_solver() else {
             return;
         };
         let request = SolveRequest {
             pre_pow: vec![0],
             nonce: 0,
-            job: None,
+            live_work: false,
             edge_bits: 12,
             cycle_length: 4,
             rounds: 20,
@@ -2740,14 +2859,14 @@ mod tests {
     }
 
     #[test]
-    fn gpu_survivors_match_cpu_reference() {
+    fn survivors_match_cpu() {
         let Some(solver) = gpu_solver() else {
             return;
         };
         let request = SolveRequest {
             pre_pow: vec![0],
             nonce: 7,
-            job: None,
+            live_work: false,
             edge_bits: 12,
             cycle_length: 4,
             rounds: 8,
@@ -2764,14 +2883,14 @@ mod tests {
     }
 
     #[test]
-    fn gpu_bucketed_mark_and_trim_match_direct_at_c24() {
+    fn bucketed_matches_direct_c24() {
         let Some(solver) = gpu_solver() else {
             return;
         };
         let request = SolveRequest {
             pre_pow: vec![0],
             nonce: 7,
-            job: None,
+            live_work: false,
             edge_bits: 24,
             cycle_length: 42,
             rounds: BUCKETED_MARK_ROUNDS,
@@ -2814,11 +2933,10 @@ mod tests {
     }
 
     #[test]
-    fn gpu_slean_parts_match_direct_at_c24() {
+    fn slean_parts_match_direct_c24() {
         let Ok(solver) = GpuWgpuSolver::new_with_config(GpuWgpuConfig {
             trimming: TrimmingMode::Slean,
-            // Exercises the four-way arena sharding that makes C32 parts=2
-            // fit below wgpu's per-binding limit.
+            // Exercise the arena sharding used for C32.
             slean_parts: 2,
             local_ram_kib: 32,
         }) else {
@@ -2831,7 +2949,7 @@ mod tests {
         let request = SolveRequest {
             pre_pow: vec![0],
             nonce: 7,
-            job: None,
+            live_work: false,
             edge_bits: 24,
             cycle_length: 42,
             rounds: BUCKETED_MARK_ROUNDS,
@@ -2876,7 +2994,7 @@ mod tests {
     }
 
     #[test]
-    fn gpu_slean_overflow_restores_and_falls_back_exactly_at_c24() {
+    fn slean_overflow_falls_back_c24() {
         let Ok(solver) = GpuWgpuSolver::new_with_config(GpuWgpuConfig {
             trimming: TrimmingMode::Slean,
             slean_parts: 4,
@@ -2891,7 +3009,7 @@ mod tests {
         let request = SolveRequest {
             pre_pow: vec![0],
             nonce: 7,
-            job: None,
+            live_work: false,
             edge_bits: 24,
             cycle_length: 42,
             rounds: 1,
@@ -2927,15 +3045,16 @@ mod tests {
         assert_eq!(fallback, direct);
     }
 
+    #[cfg(feature = "diagnostics")]
     #[test]
-    fn gpu_full_fine_loop_matches_direct_at_c24() {
+    fn fine_loop_matches_direct_c24() {
         let Some(solver) = gpu_solver() else {
             return;
         };
         let request = SolveRequest {
             pre_pow: vec![0],
             nonce: 7,
-            job: None,
+            live_work: false,
             edge_bits: 24,
             cycle_length: 42,
             rounds: 6,
@@ -2958,14 +3077,14 @@ mod tests {
     }
 
     #[test]
-    fn gpu_production_sharded_fine_from_round_two_matches_direct_at_c24() {
+    fn sharded_fine_matches_direct_c24() {
         let Some(solver) = gpu_solver() else {
             return;
         };
         let request = SolveRequest {
             pre_pow: vec![0],
             nonce: 7,
-            job: None,
+            live_work: false,
             edge_bits: 24,
             cycle_length: 42,
             rounds: 64,
@@ -3003,7 +3122,7 @@ mod tests {
     }
 
     #[test]
-    fn gpu_slean_to_fine_matches_direct_at_c24() {
+    fn slean_fine_matches_direct_c24() {
         let Ok(solver) = GpuWgpuSolver::new_with_config(GpuWgpuConfig {
             trimming: TrimmingMode::Slean,
             slean_parts: 4,
@@ -3017,7 +3136,7 @@ mod tests {
         let request = SolveRequest {
             pre_pow: vec![0],
             nonce: 7,
-            job: None,
+            live_work: false,
             edge_bits: 24,
             cycle_length: 42,
             rounds: 64,
