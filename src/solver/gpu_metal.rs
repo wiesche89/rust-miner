@@ -208,6 +208,37 @@ mod native {
             }
         }
 
+        kernel void grin_miner_bucket_seed_alive_nodes(
+            device uint *arena [[buffer(0)]],
+            device atomic_uint *counts [[buffer(1)]],
+            device atomic_uint *overflow [[buffer(2)]],
+            constant EndpointParams &params [[buffer(3)]],
+            device const uint *edges [[buffer(4)]],
+            uint gid [[thread_position_in_grid]])
+        {
+            const uint word_count = (params.edge_count + 31u) >> 5u;
+            if (gid >= word_count) return;
+            const uint bucket_shift = params.edge_bits > 18u ? 18u : params.edge_bits;
+            const uint first_edge = params.edge_base + gid * 32u;
+            uint alive = edges[first_edge >> 5u];
+            while (alive != 0u) {
+                const uint bit = ctz(alive);
+                const uint edge = first_edge + bit;
+                if (edge - params.edge_base < params.edge_count) {
+                    const uint node = cuckatoo_endpoint(edge, params);
+                    const uint bucket = node >> bucket_shift;
+                    const uint slot = atomic_fetch_add_explicit(
+                        &counts[bucket], 1u, memory_order_relaxed);
+                    if (slot < params.capacity) {
+                        arena[bucket * params.capacity + slot] = node;
+                    } else {
+                        atomic_fetch_add_explicit(overflow, 1u, memory_order_relaxed);
+                    }
+                }
+                alive &= alive - 1u;
+            }
+        }
+
         kernel void grin_miner_bucket_mark(
             device const uint *arena [[buffer(0)]],
             device const uint *counts [[buffer(1)]],
@@ -229,6 +260,41 @@ mod native {
             for (uint slot = lid; slot < count; slot += group_size) {
                 const uint edge = arena[bucket * capacity + slot];
                 const uint node = cuckatoo_endpoint(edge, params);
+                const uint suffix = node & ((1u << bucket_shift) - 1u);
+                atomic_fetch_or_explicit(
+                    &seen[suffix >> 5u], 1u << (suffix & 31u),
+                    memory_order_relaxed);
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            const uint words_per_bucket = 1u << (bucket_shift - 5u);
+            for (uint word = lid; word < words_per_bucket; word += group_size) {
+                const uint value = atomic_load_explicit(&seen[word], memory_order_relaxed);
+                atomic_fetch_or_explicit(
+                    &nodes[bucket * words_per_bucket + word], value,
+                    memory_order_relaxed);
+            }
+        }
+
+        kernel void grin_miner_bucket_mark_nodes(
+            device const uint *arena [[buffer(0)]],
+            device const uint *counts [[buffer(1)]],
+            device atomic_uint *nodes [[buffer(2)]],
+            constant EndpointParams &params [[buffer(3)]],
+            uint lid [[thread_position_in_threadgroup]],
+            uint bucket [[threadgroup_position_in_grid]],
+            uint group_size [[threads_per_threadgroup]])
+        {
+            threadgroup atomic_uint seen[8192];
+            for (uint word = lid; word < 8192u; word += group_size) {
+                atomic_store_explicit(&seen[word], 0u, memory_order_relaxed);
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            const uint bucket_shift = params.edge_bits > 18u ? 18u : params.edge_bits;
+            const uint count = min(counts[bucket], params.capacity);
+            for (uint slot = lid; slot < count; slot += group_size) {
+                const uint node = arena[bucket * params.capacity + slot];
                 const uint suffix = node & ((1u << bucket_shift) - 1u);
                 atomic_fetch_or_explicit(
                     &seen[suffix >> 5u], 1u << (suffix & 31u),
@@ -461,7 +527,9 @@ mod native {
         clear_dead_counts_pipeline: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
         bucket_seed_pipeline: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
         bucket_seed_alive_pipeline: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+        bucket_seed_alive_nodes_pipeline: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
         bucket_mark_pipeline: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+        bucket_mark_nodes_pipeline: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
         bucket_trim_pipeline: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
         bucket_collect_dead_pipeline: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
         bucket_apply_dead_pipeline: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
@@ -546,6 +614,14 @@ mod native {
                         "Metal alive bucket seed pipeline compile failed: {error}"
                     ))
                 })?;
+            let bucket_seed_alive_nodes_function = library
+                .newFunctionWithName(&NSString::from_str("grin_miner_bucket_seed_alive_nodes"))
+                .ok_or_else(|| SolveError::Gpu("native node seed function is missing".into()))?;
+            let bucket_seed_alive_nodes_pipeline = device
+                .newComputePipelineStateWithFunction_error(&bucket_seed_alive_nodes_function)
+                .map_err(|error| {
+                    SolveError::Gpu(format!("Metal node seed pipeline compile failed: {error}"))
+                })?;
             let bucket_mark_function = library
                 .newFunctionWithName(&NSString::from_str("grin_miner_bucket_mark"))
                 .ok_or_else(|| SolveError::Gpu("native bucket mark function is missing".into()))?;
@@ -554,6 +630,16 @@ mod native {
                 .map_err(|error| {
                     SolveError::Gpu(format!(
                         "Metal bucket mark pipeline compile failed: {error}"
+                    ))
+                })?;
+            let bucket_mark_nodes_function = library
+                .newFunctionWithName(&NSString::from_str("grin_miner_bucket_mark_nodes"))
+                .ok_or_else(|| SolveError::Gpu("native cached mark function is missing".into()))?;
+            let bucket_mark_nodes_pipeline = device
+                .newComputePipelineStateWithFunction_error(&bucket_mark_nodes_function)
+                .map_err(|error| {
+                    SolveError::Gpu(format!(
+                        "Metal cached mark pipeline compile failed: {error}"
                     ))
                 })?;
             let bucket_trim_function = library
@@ -609,7 +695,9 @@ mod native {
                 clear_dead_counts_pipeline,
                 bucket_seed_pipeline,
                 bucket_seed_alive_pipeline,
+                bucket_seed_alive_nodes_pipeline,
                 bucket_mark_pipeline,
+                bucket_mark_nodes_pipeline,
                 bucket_trim_pipeline,
                 bucket_collect_dead_pipeline,
                 bucket_apply_dead_pipeline,
@@ -1343,7 +1431,7 @@ mod native {
                 let encoder = command_buffer
                     .computeCommandEncoder()
                     .ok_or_else(|| SolveError::Gpu("native round compute encoder failed".into()))?;
-                const THREADS: usize = 256;
+                const THREADS: usize = 1024;
                 encoder.setComputePipelineState(&self.clear_nodes_pipeline);
                 unsafe {
                     encoder.setBuffer_offset_atIndex(Some(&nodes), 0, 0);
@@ -1398,7 +1486,11 @@ mod native {
                                 },
                             );
 
-                            encoder.setComputePipelineState(&self.bucket_seed_alive_pipeline);
+                            encoder.setComputePipelineState(if trim_phase || part + 1 == parts {
+                                &self.bucket_seed_alive_pipeline
+                            } else {
+                                &self.bucket_seed_alive_nodes_pipeline
+                            });
                             unsafe {
                                 encoder.setBuffer_offset_atIndex(Some(&scratch.arena), 0, 0);
                                 encoder.setBuffer_offset_atIndex(Some(&scratch.counts), 0, 1);
@@ -1498,7 +1590,11 @@ mod native {
                                 },
                             );
                         } else {
-                            encoder.setComputePipelineState(&self.bucket_mark_pipeline);
+                            encoder.setComputePipelineState(if part + 1 == parts {
+                                &self.bucket_mark_pipeline
+                            } else {
+                                &self.bucket_mark_nodes_pipeline
+                            });
                             unsafe {
                                 encoder.setBuffer_offset_atIndex(Some(&scratch.arena), 0, 0);
                                 encoder.setBuffer_offset_atIndex(Some(&scratch.counts), 0, 1);
@@ -1646,7 +1742,7 @@ mod native {
             let encoder = command_buffer
                 .computeCommandEncoder()
                 .ok_or_else(|| SolveError::Gpu("hybrid seed encoder failed".into()))?;
-            const THREADS: usize = 256;
+            const THREADS: usize = 1024;
             encoder.setComputePipelineState(&self.bucket_seed_alive_pipeline);
             for part in 0..parts {
                 params.edge_base = part * params.edge_count;
