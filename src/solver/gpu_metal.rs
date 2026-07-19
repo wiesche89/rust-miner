@@ -110,6 +110,56 @@ mod native {
             return cuckatoo_endpoint_side(edge, params, params.side);
         }
 
+        struct SipStatePair { ulong2 v0; ulong2 v1; ulong2 v2; ulong2 v3; };
+
+        inline ulong2 rotl64_pair(const ulong2 value, const uint amount) {
+            return (value << amount) | (value >> (64u - amount));
+        }
+
+        inline SipStatePair sip_round_pair(SipStatePair v) {
+            v.v0 += v.v1;
+            v.v2 += v.v3;
+            v.v1 = rotl64_pair(v.v1, 13u) ^ v.v0;
+            v.v3 = rotl64_pair(v.v3, 16u) ^ v.v2;
+            v.v0 = rotl64_pair(v.v0, 32u);
+            v.v2 += v.v1;
+            v.v0 += v.v3;
+            v.v1 = rotl64_pair(v.v1, 17u) ^ v.v2;
+            v.v3 = rotl64_pair(v.v3, 21u) ^ v.v0;
+            v.v2 = rotl64_pair(v.v2, 32u);
+            return v;
+        }
+
+        inline uint2 cuckatoo_endpoint_pair(const uint edge,
+                                            constant EndpointParams &params) {
+            const ulong base = ulong(edge) << 1u;
+            const ulong2 nonce = ulong2{
+                base | (params.side & 1u),
+                base | ((params.side ^ 1u) & 1u)};
+            SipStatePair v = SipStatePair{
+                ulong2(params.k0), ulong2(params.k1), ulong2(params.k2),
+                ulong2(params.k3) ^ nonce};
+            v = sip_round_pair(v);
+            v = sip_round_pair(v);
+            v.v0 ^= nonce;
+            v.v2 ^= 255u;
+            v = sip_round_pair(v);
+            v = sip_round_pair(v);
+            v = sip_round_pair(v);
+            const ulong2 b0 = v.v0 + v.v1;
+            const ulong2 b2 = v.v2 + v.v3;
+            const ulong2 c1 = rotl64_pair(v.v1, 13u) ^ b0;
+            const ulong2 c3 = rotl64_pair(v.v3, 16u) ^ b2;
+            const ulong2 d2 = b2 + c1;
+            uint2 result = uint2(
+                rotl64_pair(c1, 17u) ^ rotl64_pair(c3, 21u) ^ d2 ^
+                (d2 >> 32u));
+            if (params.edge_bits < 32u) {
+                result &= (1u << params.edge_bits) - 1u;
+            }
+            return result;
+        }
+
         kernel void grin_miner_endpoints(
             device uint *nodes [[buffer(0)]],
             constant EndpointParams &params [[buffer(1)]],
@@ -448,13 +498,13 @@ mod native {
 
             for (uint slot = lid; slot < count; slot += group_size) {
                 const uint edge = source_arena[bucket * capacity + slot];
-                const uint node = cuckatoo_endpoint(edge, params);
+                const uint2 endpoints = cuckatoo_endpoint_pair(edge, params);
+                const uint node = endpoints.x;
                 const uint mate = (node ^ 1u) & ((1u << bucket_shift) - 1u);
                 if ((atomic_load_explicit(
                         &seen[mate >> 5u], memory_order_relaxed) &
                         (1u << (mate & 31u))) != 0u) {
-                    const uint other = cuckatoo_endpoint_side(
-                        edge, params, params.side ^ 1u);
+                    const uint other = endpoints.y;
                     const uint destination_bucket = other >> bucket_shift;
                     const uint destination_slot = atomic_fetch_add_explicit(
                         &destination_counts[destination_bucket], 1u,

@@ -21,8 +21,11 @@ pub(crate) fn peel_two_core(
 
     let mut edge_groups = vec![[0_u32; 2]; survivors.len()];
     let mut group_keys = Vec::<u32>::with_capacity(survivors.len());
-    let mut group_offsets = vec![0_usize];
-    let mut group_edges = Vec::<u32>::with_capacity(survivors.len() * 2);
+    let mut side_offsets = [vec![0_u32], vec![0_u32]];
+    let mut side_edges = [
+        Vec::<u32>::with_capacity(survivors.len()),
+        Vec::<u32>::with_capacity(survivors.len()),
+    ];
     let mut side_group_starts = [0_usize; 3];
     let endpoint_pairs: Vec<[u32; 2]> = survivors
         .iter()
@@ -49,9 +52,9 @@ pub(crate) fn peel_two_core(
             group_keys.push(key);
             for &edge in &order[begin..end] {
                 edge_groups[edge as usize][side] = group;
-                group_edges.push(edge);
+                side_edges[side].push(edge);
             }
-            group_offsets.push(group_edges.len());
+            side_offsets[side].push(side_edges[side].len() as u32);
             begin = end;
         }
         side_group_starts[side + 1] = group_keys.len();
@@ -73,10 +76,10 @@ pub(crate) fn peel_two_core(
         }
     }
 
-    let mut live_count: Vec<usize> = group_offsets
-        .windows(2)
-        .map(|range| range[1] - range[0])
-        .collect();
+    let mut live_count = Vec::with_capacity(group_keys.len());
+    for offsets in &side_offsets {
+        live_count.extend(offsets.windows(2).map(|range| range[1] - range[0]));
+    }
     let mut alive = vec![true; survivors.len()];
     let mut queued = vec![false; group_keys.len()];
     let mut queue = VecDeque::new();
@@ -89,7 +92,11 @@ pub(crate) fn peel_two_core(
 
     while let Some(group) = queue.pop_front() {
         let group = group as usize;
-        for &edge in &group_edges[group_offsets[group]..group_offsets[group + 1]] {
+        let side = usize::from(group >= side_group_starts[1]);
+        let local_group = group - side_group_starts[side];
+        let begin = side_offsets[side][local_group] as usize;
+        let end = side_offsets[side][local_group + 1] as usize;
+        for &edge in &side_edges[side][begin..end] {
             let edge = edge as usize;
             if !alive[edge] {
                 continue;
