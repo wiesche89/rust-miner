@@ -56,72 +56,48 @@ mod native {
             uint destination_capacity;
         };
 
-        struct U64Words { uint lo; uint hi; };
-        struct SipState32 { U64Words v0; U64Words v1; U64Words v2; U64Words v3; };
+        struct SipState64 { ulong v0; ulong v1; ulong v2; ulong v3; };
 
-        inline U64Words words(const ulong value) {
-            return U64Words{uint(value), uint(value >> 32u)};
+        inline ulong rotl64(const ulong value, const uint amount) {
+            return (value << amount) | (value >> (64u - amount));
         }
 
-        inline U64Words add_words(const U64Words a, const U64Words b) {
-            const uint lo = a.lo + b.lo;
-            return U64Words{lo, a.hi + b.hi + uint(lo < a.lo)};
-        }
-
-        inline U64Words xor_words(const U64Words a, const U64Words b) {
-            return U64Words{a.lo ^ b.lo, a.hi ^ b.hi};
-        }
-
-        inline U64Words rotl_words(const U64Words a, const uint amount) {
-            if (amount == 32u) return U64Words{a.hi, a.lo};
-            if (amount < 32u) {
-                return U64Words{
-                    (a.lo << amount) | (a.hi >> (32u - amount)),
-                    (a.hi << amount) | (a.lo >> (32u - amount))};
-            }
-            const uint shift = amount - 32u;
-            return U64Words{
-                (a.hi << shift) | (a.lo >> (32u - shift)),
-                (a.lo << shift) | (a.hi >> (32u - shift))};
-        }
-
-        inline SipState32 sip_round32(SipState32 v) {
-            v.v0 = add_words(v.v0, v.v1);
-            v.v2 = add_words(v.v2, v.v3);
-            v.v1 = xor_words(rotl_words(v.v1, 13u), v.v0);
-            v.v3 = xor_words(rotl_words(v.v3, 16u), v.v2);
-            v.v0 = rotl_words(v.v0, 32u);
-            v.v2 = add_words(v.v2, v.v1);
-            v.v0 = add_words(v.v0, v.v3);
-            v.v1 = xor_words(rotl_words(v.v1, 17u), v.v2);
-            v.v3 = xor_words(rotl_words(v.v3, 21u), v.v0);
-            v.v2 = rotl_words(v.v2, 32u);
+        inline SipState64 sip_round64(SipState64 v) {
+            v.v0 += v.v1;
+            v.v2 += v.v3;
+            v.v1 = rotl64(v.v1, 13u) ^ v.v0;
+            v.v3 = rotl64(v.v3, 16u) ^ v.v2;
+            v.v0 = rotl64(v.v0, 32u);
+            v.v2 += v.v1;
+            v.v0 += v.v3;
+            v.v1 = rotl64(v.v1, 17u) ^ v.v2;
+            v.v3 = rotl64(v.v3, 21u) ^ v.v0;
+            v.v2 = rotl64(v.v2, 32u);
             return v;
         }
 
-        inline uint sip_final_low(const SipState32 v) {
-            const U64Words b0 = add_words(v.v0, v.v1);
-            const U64Words b2 = add_words(v.v2, v.v3);
-            const U64Words c1 = xor_words(rotl_words(v.v1, 13u), b0);
-            const U64Words c3 = xor_words(rotl_words(v.v3, 16u), b2);
-            const U64Words d2 = add_words(b2, c1);
-            return rotl_words(c1, 17u).lo ^ rotl_words(c3, 21u).lo ^ d2.lo ^ d2.hi;
+        inline uint sip_final_low(const SipState64 v) {
+            const ulong b0 = v.v0 + v.v1;
+            const ulong b2 = v.v2 + v.v3;
+            const ulong c1 = rotl64(v.v1, 13u) ^ b0;
+            const ulong c3 = rotl64(v.v3, 16u) ^ b2;
+            const ulong d2 = b2 + c1;
+            return uint(rotl64(c1, 17u) ^ rotl64(c3, 21u) ^ d2 ^ (d2 >> 32u));
         }
 
         inline uint cuckatoo_endpoint_side(const uint edge,
                                            constant EndpointParams &params,
                                            const uint side) {
-            const U64Words nonce = U64Words{(edge << 1u) | (side & 1u), edge >> 31u};
-            SipState32 v = SipState32{
-                words(params.k0), words(params.k1), words(params.k2),
-                xor_words(words(params.k3), nonce)};
-            v = sip_round32(v);
-            v = sip_round32(v);
-            v.v0 = xor_words(v.v0, nonce);
-            v.v2 = xor_words(v.v2, U64Words{255u, 0u});
-            v = sip_round32(v);
-            v = sip_round32(v);
-            v = sip_round32(v);
+            const ulong nonce = (ulong(edge) << 1u) | (side & 1u);
+            SipState64 v = SipState64{
+                params.k0, params.k1, params.k2, params.k3 ^ nonce};
+            v = sip_round64(v);
+            v = sip_round64(v);
+            v.v0 ^= nonce;
+            v.v2 ^= 255u;
+            v = sip_round64(v);
+            v = sip_round64(v);
+            v = sip_round64(v);
             uint result = sip_final_low(v);
             if (params.edge_bits < 32u) {
                 result &= (1u << params.edge_bits) - 1u;
@@ -1391,54 +1367,62 @@ mod native {
                 );
 
                 for trim_phase in [false, true] {
-                    for part in 0..parts {
+                    for offset in 0..parts {
+                        let part = if trim_phase {
+                            parts - 1 - offset
+                        } else {
+                            offset
+                        };
+                        let reuse_seed = trim_phase && offset == 0;
                         scratch.params.edge_base = part * scratch.params.edge_count;
-                        encoder.setComputePipelineState(&self.clear_counts_pipeline);
-                        unsafe {
-                            encoder.setBuffer_offset_atIndex(Some(&scratch.counts), 0, 0);
-                            encoder.setBytes_length_atIndex(
-                                NonNull::from(&scratch.params).cast::<c_void>(),
-                                size_of::<EndpointParams>(),
-                                1,
+                        if !reuse_seed {
+                            encoder.setComputePipelineState(&self.clear_counts_pipeline);
+                            unsafe {
+                                encoder.setBuffer_offset_atIndex(Some(&scratch.counts), 0, 0);
+                                encoder.setBytes_length_atIndex(
+                                    NonNull::from(&scratch.params).cast::<c_void>(),
+                                    size_of::<EndpointParams>(),
+                                    1,
+                                );
+                            }
+                            encoder.dispatchThreadgroups_threadsPerThreadgroup(
+                                MTLSize {
+                                    width: buckets.div_ceil(THREADS),
+                                    height: 1,
+                                    depth: 1,
+                                },
+                                MTLSize {
+                                    width: THREADS,
+                                    height: 1,
+                                    depth: 1,
+                                },
                             );
-                        }
-                        encoder.dispatchThreadgroups_threadsPerThreadgroup(
-                            MTLSize {
-                                width: buckets.div_ceil(THREADS),
-                                height: 1,
-                                depth: 1,
-                            },
-                            MTLSize {
-                                width: THREADS,
-                                height: 1,
-                                depth: 1,
-                            },
-                        );
 
-                        encoder.setComputePipelineState(&self.bucket_seed_alive_pipeline);
-                        unsafe {
-                            encoder.setBuffer_offset_atIndex(Some(&scratch.arena), 0, 0);
-                            encoder.setBuffer_offset_atIndex(Some(&scratch.counts), 0, 1);
-                            encoder.setBuffer_offset_atIndex(Some(&overflow), 0, 2);
-                            encoder.setBytes_length_atIndex(
-                                NonNull::from(&scratch.params).cast::<c_void>(),
-                                size_of::<EndpointParams>(),
-                                3,
+                            encoder.setComputePipelineState(&self.bucket_seed_alive_pipeline);
+                            unsafe {
+                                encoder.setBuffer_offset_atIndex(Some(&scratch.arena), 0, 0);
+                                encoder.setBuffer_offset_atIndex(Some(&scratch.counts), 0, 1);
+                                encoder.setBuffer_offset_atIndex(Some(&overflow), 0, 2);
+                                encoder.setBytes_length_atIndex(
+                                    NonNull::from(&scratch.params).cast::<c_void>(),
+                                    size_of::<EndpointParams>(),
+                                    3,
+                                );
+                                encoder.setBuffer_offset_atIndex(Some(&edges), 0, 4);
+                            }
+                            encoder.dispatchThreadgroups_threadsPerThreadgroup(
+                                MTLSize {
+                                    width: part_edges.div_ceil(32).div_ceil(THREADS),
+                                    height: 1,
+                                    depth: 1,
+                                },
+                                MTLSize {
+                                    width: THREADS,
+                                    height: 1,
+                                    depth: 1,
+                                },
                             );
-                            encoder.setBuffer_offset_atIndex(Some(&edges), 0, 4);
                         }
-                        encoder.dispatchThreadgroups_threadsPerThreadgroup(
-                            MTLSize {
-                                width: part_edges.div_ceil(32).div_ceil(THREADS),
-                                height: 1,
-                                depth: 1,
-                            },
-                            MTLSize {
-                                width: THREADS,
-                                height: 1,
-                                depth: 1,
-                            },
-                        );
 
                         if trim_phase {
                             encoder.setComputePipelineState(&self.clear_dead_counts_pipeline);
